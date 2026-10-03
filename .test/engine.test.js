@@ -114,6 +114,221 @@ var init_samples = __esm({
   }
 });
 
+// src/lib/routing.ts
+var routing_exports = {};
+__export(routing_exports, {
+  DEFAULT_BUS_ID: () => DEFAULT_BUS_ID,
+  MASTER_OUTPUT_ID: () => MASTER_OUTPUT_ID,
+  RoutingError: () => RoutingError,
+  addBus: () => addBus,
+  createDefaultRouting: () => createDefaultRouting,
+  findDanglingMembers: () => findDanglingMembers,
+  moveTrackToBus: () => moveTrackToBus,
+  normalizeDoc: () => normalizeDoc,
+  outputChain: () => outputChain,
+  patchBus: () => patchBus,
+  removeBus: () => removeBus,
+  setBusOutput: () => setBusOutput,
+  validateRouting: () => validateRouting,
+  wouldCreateCycle: () => wouldCreateCycle
+});
+function nextBusId() {
+  busCounter += 1;
+  return `bus-${Date.now().toString(36)}-${busCounter}`;
+}
+function createDefaultRouting() {
+  return {
+    version: 1,
+    buses: [
+      {
+        id: DEFAULT_BUS_ID,
+        name: "\u603B\u7EBF A",
+        gain: 1,
+        muted: false,
+        solo: false,
+        output: MASTER_OUTPUT_ID,
+        color: BUS_COLORS[0]
+      }
+    ]
+  };
+}
+function outputChain(buses, startId) {
+  const byId = new Map(buses.map((b) => [b.id, b]));
+  const chain = [];
+  const seen = /* @__PURE__ */ new Set();
+  let cur = byId.get(startId);
+  while (cur && !seen.has(cur.id)) {
+    seen.add(cur.id);
+    chain.push(cur.id);
+    if (cur.output === MASTER_OUTPUT_ID) break;
+    cur = byId.get(cur.output);
+  }
+  return chain;
+}
+function wouldCreateCycle(buses, busId, newOutput) {
+  if (newOutput === MASTER_OUTPUT_ID) return false;
+  if (newOutput === busId) return true;
+  if (!buses.some((b) => b.id === newOutput)) return false;
+  return outputChain(buses, newOutput).includes(busId);
+}
+function validateRouting(routing, tracks) {
+  if (routing.buses.length === 0) {
+    throw new RoutingError("\u8DEF\u7531\u56FE\u81F3\u5C11\u9700\u8981\u4E00\u6761\u603B\u7EBF");
+  }
+  const ids = /* @__PURE__ */ new Set();
+  for (const b of routing.buses) {
+    if (ids.has(b.id)) throw new RoutingError(`\u603B\u7EBF id \u91CD\u590D\uFF1A${b.id}`);
+    ids.add(b.id);
+    if (b.output !== MASTER_OUTPUT_ID && !ids.has(b.output) && !routing.buses.some((x) => x.id === b.output)) {
+      throw new RoutingError(`\u603B\u7EBF\u300C${b.name}\u300D\u7684\u8F93\u51FA\u6307\u5411\u4E0D\u5B58\u5728\u7684\u603B\u7EBF`);
+    }
+  }
+  for (const b of routing.buses) {
+    const chain = outputChain(routing.buses, b.id);
+    const last = routing.buses.find((x) => x.id === chain[chain.length - 1]);
+    if (last && last.output !== MASTER_OUTPUT_ID && chain.includes(last.output)) {
+      throw new RoutingError(`\u603B\u7EBF\u300C${b.name}\u300D\u7684\u8F93\u51FA\u94FE\u5B58\u5728\u5FAA\u73AF`);
+    }
+  }
+  for (const t of tracks) {
+    if (!ids.has(t.busId)) {
+      throw new RoutingError(`\u58F0\u8F68\u300C${t.name}\u300D\u5F52\u5C5E\u7684\u603B\u7EBF\u4E0D\u5B58\u5728\uFF08\u60AC\u7A7A\u6210\u5458\uFF09`);
+    }
+  }
+}
+function findDanglingMembers(routing, tracks) {
+  const ids = new Set(routing.buses.map((b) => b.id));
+  return tracks.filter((t) => !ids.has(t.busId)).map((t) => t.id);
+}
+function commit(routing, tracks) {
+  const next = { ...routing, version: routing.version + 1 };
+  validateRouting(next, tracks);
+  return { routing: next, tracks };
+}
+function addBus(routing, tracks, name) {
+  const id = nextBusId();
+  const bus = {
+    id,
+    name: name?.trim() || `\u603B\u7EBF ${String.fromCharCode(65 + routing.buses.length % 26)}`,
+    gain: 1,
+    muted: false,
+    solo: false,
+    output: MASTER_OUTPUT_ID,
+    color: BUS_COLORS[routing.buses.length % BUS_COLORS.length]
+  };
+  const r = commit({ ...routing, buses: [...routing.buses, bus] }, tracks);
+  return { ...r, busId: id };
+}
+function removeBus(routing, tracks, busId) {
+  const bus = routing.buses.find((b) => b.id === busId);
+  if (!bus) throw new RoutingError("\u8981\u5220\u9664\u7684\u603B\u7EBF\u4E0D\u5B58\u5728");
+  if (routing.buses.length <= 1) throw new RoutingError("\u81F3\u5C11\u4FDD\u7559\u4E00\u6761\u603B\u7EBF\uFF0C\u65E0\u6CD5\u5220\u9664");
+  const members = tracks.filter((t) => t.busId === busId);
+  if (members.length > 0) {
+    throw new RoutingError(
+      `\u603B\u7EBF\u300C${bus.name}\u300D\u4ECD\u6709 ${members.length} \u6761\u58F0\u8F68\uFF0C\u9700\u5148\u79FB\u51FA\u6210\u5458\u518D\u5220\u9664`
+    );
+  }
+  const buses = routing.buses.filter((b) => b.id !== busId).map((b) => b.output === busId ? { ...b, output: bus.output } : b);
+  return commit({ ...routing, buses }, tracks);
+}
+function moveTrackToBus(routing, tracks, trackId, busId) {
+  if (!routing.buses.some((b) => b.id === busId)) {
+    throw new RoutingError("\u76EE\u6807\u603B\u7EBF\u4E0D\u5B58\u5728\uFF0C\u65E0\u6CD5\u8FC1\u79FB\u58F0\u8F68");
+  }
+  const track = tracks.find((t) => t.id === trackId);
+  if (!track) throw new RoutingError("\u8981\u8FC1\u79FB\u7684\u58F0\u8F68\u4E0D\u5B58\u5728");
+  if (track.busId === busId) return { routing, tracks };
+  const nextTracks = tracks.map((t) => t.id === trackId ? { ...t, busId } : t);
+  return commit(routing, nextTracks);
+}
+function setBusOutput(routing, tracks, busId, output) {
+  const bus = routing.buses.find((b) => b.id === busId);
+  if (!bus) throw new RoutingError("\u603B\u7EBF\u4E0D\u5B58\u5728");
+  if (output !== MASTER_OUTPUT_ID && !routing.buses.some((b) => b.id === output)) {
+    throw new RoutingError("\u8F93\u51FA\u76EE\u6807\u4E0D\u5B58\u5728");
+  }
+  if (wouldCreateCycle(routing.buses, busId, output)) {
+    throw new RoutingError(`\u8BE5\u8F93\u51FA\u4F1A\u5F62\u6210\u5FAA\u73AF\u8DEF\u7531\uFF0C\u5DF2\u62D2\u7EDD\uFF08\u300C${bus.name}\u300D\u4FDD\u6301\u539F\u8F93\u51FA\uFF09`);
+  }
+  if (bus.output === output) return { routing, tracks };
+  const buses = routing.buses.map((b) => b.id === busId ? { ...b, output } : b);
+  return commit({ ...routing, buses }, tracks);
+}
+function patchBus(routing, tracks, busId, patch) {
+  if (!routing.buses.some((b) => b.id === busId)) throw new RoutingError("\u603B\u7EBF\u4E0D\u5B58\u5728");
+  const buses = routing.buses.map((b) => b.id === busId ? { ...b, ...patch } : b);
+  return commit({ ...routing, buses }, tracks);
+}
+function normalizeDoc(raw) {
+  let routing;
+  if (raw.routing && Array.isArray(raw.routing.buses) && raw.routing.buses.length > 0) {
+    routing = {
+      version: Math.max(1, raw.routing.version ?? 1),
+      buses: raw.routing.buses.map((b, i) => ({
+        id: b.id,
+        name: b.name ?? `\u603B\u7EBF ${i + 1}`,
+        gain: typeof b.gain === "number" ? b.gain : 1,
+        muted: !!b.muted,
+        solo: !!b.solo,
+        output: b.output ?? MASTER_OUTPUT_ID,
+        color: b.color ?? BUS_COLORS[i % BUS_COLORS.length]
+      }))
+    };
+  } else {
+    const def = createDefaultRouting();
+    def.buses[0].gain = typeof raw.busGain === "number" ? raw.busGain : 1;
+    routing = def;
+  }
+  const ids = new Set(routing.buses.map((b) => b.id));
+  routing = {
+    ...routing,
+    buses: routing.buses.map((b) => {
+      if (b.output !== MASTER_OUTPUT_ID && !ids.has(b.output)) {
+        return { ...b, output: MASTER_OUTPUT_ID };
+      }
+      if (b.output !== MASTER_OUTPUT_ID && wouldCreateCycle(routing.buses, b.id, b.output)) {
+        return { ...b, output: MASTER_OUTPUT_ID };
+      }
+      return b;
+    })
+  };
+  const fallbackBus = routing.buses[0].id;
+  const busIds = new Set(routing.buses.map((b) => b.id));
+  const tracks = (raw.tracks ?? []).map((t) => ({
+    ...t,
+    busId: t.busId && busIds.has(t.busId) ? t.busId : fallbackBus
+  }));
+  const doc = {
+    version: 2,
+    tracks,
+    listener: raw.listener,
+    spatial: raw.spatial,
+    routing,
+    masterGain: typeof raw.masterGain === "number" ? raw.masterGain : 0.9,
+    savedAt: raw.savedAt ?? 0,
+    name: raw.name
+  };
+  validateRouting(doc.routing, doc.tracks);
+  return doc;
+}
+var MASTER_OUTPUT_ID, DEFAULT_BUS_ID, RoutingError, BUS_COLORS, busCounter;
+var init_routing = __esm({
+  "src/lib/routing.ts"() {
+    "use strict";
+    MASTER_OUTPUT_ID = "master";
+    DEFAULT_BUS_ID = "bus-main";
+    RoutingError = class extends Error {
+      constructor(message) {
+        super(message);
+        this.name = "RoutingError";
+      }
+    };
+    BUS_COLORS = ["#4ecdc4", "#ffe066", "#a78bfa", "#f472b6", "#34d399", "#60a5fa", "#e8734a"];
+    busCounter = 0;
+  }
+});
+
 // src/lib/audioEngine.ts
 var audioEngine_exports = {};
 __export(audioEngine_exports, {
@@ -135,6 +350,7 @@ var init_audioEngine = __esm({
     "use strict";
     init_spatial();
     init_samples();
+    init_routing();
     DecodeError = class extends Error {
       trackId;
       constructor(trackId, message) {
@@ -146,10 +362,9 @@ var init_audioEngine = __esm({
     AudioEngine = class {
       ctx = null;
       unlock = "locked";
-      busGain = null;
+      routing = createDefaultRouting();
+      busNodes = /* @__PURE__ */ new Map();
       masterGain = null;
-      soloBus = null;
-      muteBus = null;
       analyser = null;
       timeDomainBuf = new Float32Array(new ArrayBuffer(8192));
       peakWorklet = null;
@@ -161,6 +376,7 @@ var init_audioEngine = __esm({
       anySolo = false;
       unlockListeners = /* @__PURE__ */ new Set();
       levelListeners = /* @__PURE__ */ new Set();
+      busLevelListeners = /* @__PURE__ */ new Set();
       endedListeners = /* @__PURE__ */ new Set();
       rafHandle = 0;
       clipLatchL = false;
@@ -177,6 +393,12 @@ var init_audioEngine = __esm({
         this.levelListeners.add(fn);
         return () => {
           this.levelListeners.delete(fn);
+        };
+      }
+      onBusLevels(fn) {
+        this.busLevelListeners.add(fn);
+        return () => {
+          this.busLevelListeners.delete(fn);
         };
       }
       onEnded(fn) {
@@ -211,25 +433,25 @@ var init_audioEngine = __esm({
           this.startMeterLoop();
           void this.ensurePeakWorklet(ctx);
         } catch (err) {
+          void this.ctx?.close().catch(() => void 0);
+          this.ctx = null;
+          this.busNodes.clear();
+          this.masterGain = null;
+          this.analyser = null;
+          this.peakWorklet = null;
           this.unlock = "failed";
           this.emitUnlock();
           throw err;
         }
       }
       buildGraph(ctx) {
-        this.soloBus = ctx.createGain();
-        this.muteBus = ctx.createGain();
-        this.muteBus.gain.value = 0;
-        this.busGain = ctx.createGain();
         this.masterGain = ctx.createGain();
         this.analyser = ctx.createAnalyser();
         this.analyser.fftSize = 2048;
         this.timeDomainBuf = new Float32Array(new ArrayBuffer(this.analyser.fftSize * 4));
-        this.soloBus.connect(this.busGain);
-        this.muteBus.connect(this.busGain);
-        this.busGain.connect(this.masterGain);
         this.masterGain.connect(this.analyser);
         this.analyser.connect(ctx.destination);
+        this.reconcileBuses();
       }
       /**
        * 峰值/削波检测器串联在 masterGain 之后、destination 之前的真实输出链上，
@@ -309,6 +531,14 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         this.clipLatchL = false;
         this.clipLatchR = false;
       }
+      /** 清除指定总线的削波锁存 */
+      clearBusClipLatch(busId) {
+        const n = this.busNodes.get(busId);
+        if (n) {
+          n.clipL = false;
+          n.clipR = false;
+        }
+      }
       startMeterLoop() {
         const tick = () => {
           if (!this.peakWorklet && this.analyser) {
@@ -331,9 +561,103 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           }
           const p = this.lastPeak;
           this.levelListeners.forEach((fn) => fn({ ...p }));
+          if (this.busNodes.size > 0 && this.busLevelListeners.size > 0) {
+            const levels = {};
+            for (const [id, n] of this.busNodes) {
+              n.analyser.getFloatTimeDomainData(n.timeBuf);
+              let peak = 0;
+              for (let i = 0; i < n.timeBuf.length; i++) {
+                const a = Math.abs(n.timeBuf[i]);
+                if (a > peak) peak = a;
+              }
+              if (peak >= 1) {
+                n.clipL = true;
+                n.clipR = true;
+              }
+              n.lastPeak = { l: peak, r: peak, clipL: n.clipL, clipR: n.clipR };
+              levels[id] = { ...n.lastPeak };
+            }
+            this.busLevelListeners.forEach((fn) => fn(levels));
+          }
           this.rafHandle = requestAnimationFrame(tick);
         };
         this.rafHandle = requestAnimationFrame(tick);
+      }
+      // ---------- 路由图 ----------
+      /**
+       * 应用新路由图：增删总线节点组、重接总线输出、刷新有效增益，
+       * 并把现有 voice 的 panner 重新挂到所属总线。
+       * 只改连接与 AudioParam，绝不触碰 BufferSource —— 播放中迁移总线不重启、不双重发声。
+       */
+      setRouting(routing) {
+        this.routing = routing;
+        if (!this.ctx) return;
+        this.reconcileBuses();
+        for (const v of this.voices.values()) this.routeVoice(v);
+      }
+      getRouting() {
+        return this.routing;
+      }
+      /** 按路由图对齐总线节点组：删旧、建新、重接输出、下发有效增益 */
+      reconcileBuses() {
+        const ctx = this.ctx;
+        if (!ctx || !this.masterGain) return;
+        const anyBusSolo = this.routing.buses.some((b) => b.solo);
+        for (const [id, nodes] of [...this.busNodes]) {
+          if (!this.routing.buses.some((b) => b.id === id)) {
+            nodes.input.disconnect();
+            nodes.muteSink.disconnect();
+            nodes.gain.disconnect();
+            nodes.analyser.disconnect();
+            this.busNodes.delete(id);
+          }
+        }
+        for (const bus of this.routing.buses) {
+          if (this.busNodes.has(bus.id)) continue;
+          const input = ctx.createGain();
+          const muteSink = ctx.createGain();
+          muteSink.gain.value = 0;
+          const gain = ctx.createGain();
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 2048;
+          input.connect(gain);
+          muteSink.connect(gain);
+          gain.connect(analyser);
+          this.busNodes.set(bus.id, {
+            id: bus.id,
+            input,
+            muteSink,
+            gain,
+            analyser,
+            timeBuf: new Float32Array(new ArrayBuffer(analyser.fftSize * 4)),
+            clipL: false,
+            clipR: false,
+            lastPeak: { l: 0, r: 0, clipL: false, clipR: false }
+          });
+        }
+        for (const bus of this.routing.buses) {
+          const nodes = this.busNodes.get(bus.id);
+          const downstream = bus.output === MASTER_OUTPUT_ID ? this.masterGain : this.busNodes.get(bus.output)?.input ?? this.masterGain;
+          nodes.analyser.disconnect();
+          nodes.analyser.connect(downstream);
+          const effective = bus.muted ? 0 : bus.gain * (anyBusSolo && !bus.solo ? 0 : 1);
+          nodes.gain.gain.setTargetAtTime(effective, ctx.currentTime, 0.01);
+        }
+      }
+      /** 计算 voice 应挂的节点并改接（仅连接变化时才断开重接） */
+      routeVoice(voice) {
+        const track = voice.spec;
+        const audible = this.shouldBeAudible(track);
+        const busId = this.busNodes.has(track.busId) ? track.busId : this.routing.buses[0]?.id ?? DEFAULT_BUS_ID;
+        const nodes = this.busNodes.get(busId);
+        if (!nodes) return;
+        const target = audible ? nodes.input : nodes.muteSink;
+        if (voice.routedTo !== target) {
+          voice.panner.disconnect();
+          voice.panner.connect(target);
+          voice.routedTo = target;
+        }
+        voice.audiblyRouted = audible;
       }
       // ---------- 全局参数 ----------
       setSpatialSettings(s) {
@@ -344,11 +668,6 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           v.panner.refDistance = s.refDistance;
           v.panner.rolloffFactor = s.rolloffFactor;
           v.panner.maxDistance = s.maxDistance;
-        }
-      }
-      setBusGain(g2) {
-        if (this.busGain && this.ctx) {
-          this.busGain.gain.setTargetAtTime(g2, this.ctx.currentTime, 0.01);
         }
       }
       setMasterGain(g2) {
@@ -442,21 +761,21 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           splitter.connect(trackGain, ch);
         }
         trackGain.connect(panner);
-        const audible = this.shouldBeAudible(track);
-        panner.connect(audible ? this.soloBus : this.muteBus);
         const voice = {
           trackId: track.id,
           spec: track,
           source,
           trackGain,
           panner,
-          audiblyRouted: audible,
+          routedTo: null,
+          audiblyRouted: false,
           playing: false,
           consumed: false,
           startedAt: 0,
           offset: 0,
           duration: buffer.duration
         };
+        this.routeVoice(voice);
         source.onended = () => {
           if (!voice.playing) return;
           const latest = voice.spec;
@@ -475,7 +794,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         if (this.anySolo) return track.solo;
         return true;
       }
-      /** 实时参数更新：不触碰 source 节点 —— 移动声源不会重启音轨 */
+      /** 实时参数更新：不触碰 source 节点 —— 移动声源/迁移总线不会重启音轨 */
       updateVoiceLive(voice, track) {
         const ctx = this.ctx;
         const t = ctx.currentTime;
@@ -486,34 +805,12 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         voice.panner.distanceModel = this.spatial?.distanceModel ?? voice.panner.distanceModel;
         voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
         if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
-        const audible = this.shouldBeAudible(track);
-        if (audible !== voice.audiblyRouted) {
-          voice.panner.disconnect();
-          voice.panner.connect(audible ? this.soloBus : this.muteBus);
-          voice.audiblyRouted = audible;
-        }
         voice.spec = track;
-      }
-      /** 静音/独奏变化：重新评估全部路由（增益本身在 updateVoiceLive 中已设置） */
-      reevaluateRouting(tracks) {
-        this.anySolo = tracks.some((t) => t.solo);
-        if (!this.ctx) return;
-        for (const tr of tracks) {
-          const v = this.voices.get(tr.id);
-          if (!v) continue;
-          const audible = this.shouldBeAudible(tr);
-          if (audible !== v.audiblyRouted) {
-            v.panner.disconnect();
-            v.panner.connect(audible ? this.soloBus : this.muteBus);
-            v.audiblyRouted = audible;
-          }
-          v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
-          v.spec = tr;
-        }
+        this.routeVoice(voice);
       }
       /**
-       * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏路由。
-       * 不创建节点、不触碰 source，移动声源不会重启音轨。
+       * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏与总线归属路由。
+       * 不创建节点、不触碰 source，移动声源或迁移总线都不会重启音轨。
        * 尚未创建 voice 的声轨（未解锁/未解码）跳过，由 ensureTrack 负责。
        */
       syncTracks(tracks) {
@@ -594,7 +891,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       }
       /**
        * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转）。
-       * 位置移动严禁走此路径。
+       * 位置移动与总线迁移严禁走此路径。
        */
       replaceVoice(old, track, buffer, offset) {
         try {
@@ -645,6 +942,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       dispose() {
         cancelAnimationFrame(this.rafHandle);
         for (const id of [...this.voices.keys()]) this.removeTrack(id);
+        this.busNodes.clear();
         void this.ctx?.close();
         this.ctx = null;
         this.unlock = "locked";
@@ -762,8 +1060,11 @@ var FakeListener = class {
 };
 var FakeAnalyser = class extends FakeNode {
   fftSize = 2048;
+  /** 测试可注入的时域峰值 */
+  injectedPeak = 0;
   getFloatTimeDomainData(arr) {
     arr.fill(0);
+    if (this.injectedPeak > 0) arr[0] = this.injectedPeak;
   }
 };
 var FakeAudioContext = class {
@@ -820,6 +1121,7 @@ g.window = globalThis;
 g.PannerNode = FakePanner;
 var { AudioEngine: AudioEngine2, DecodeError: DecodeError2 } = await Promise.resolve().then(() => (init_audioEngine(), audioEngine_exports));
 var { createSampleBuffer: createSampleBuffer2 } = await Promise.resolve().then(() => (init_samples(), samples_exports));
+var { DEFAULT_BUS_ID: DEFAULT_BUS_ID2, createDefaultRouting: createDefaultRouting2, addBus: addBus2 } = await Promise.resolve().then(() => (init_routing(), routing_exports));
 function baseTrack(over = {}) {
   return {
     id: "t1",
@@ -828,6 +1130,7 @@ function baseTrack(over = {}) {
     loop: false,
     muted: false,
     solo: false,
+    busId: DEFAULT_BUS_ID2,
     gain: 0.8,
     channel: 0,
     color: "#fff",
@@ -835,6 +1138,17 @@ function baseTrack(over = {}) {
     status: "pending",
     ...over
   };
+}
+function twoBusRouting() {
+  const r0 = createDefaultRouting2();
+  const r1 = addBus2(r0, [], "\u603B\u7EBF B");
+  return { routing: r1.routing, busB: r1.busId };
+}
+function busNodesOf(engine) {
+  return engine.busNodes;
+}
+function voicesOf(engine) {
+  return engine.voices;
 }
 describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", () => {
   let engine;
@@ -860,7 +1174,7 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     assert.ok(Math.abs(li.upY.value - 1) < 1e-6);
     assert.ok(Math.abs(li.positionZ.value - 3) < 1e-6);
   });
-  it("\u58F0\u8F68\u94FE\u8DEF\u4E3A source\u2192trackGain\u2192HRTF panner\u2192soloBus\u2192\u2026\u2192destination\uFF1B\u8DDD\u79BB\u6A21\u578B\u53C2\u6570\u4E0B\u53D1", async () => {
+  it("\u58F0\u8F68\u94FE\u8DEF\u4E3A source\u2192trackGain\u2192HRTF panner\u2192\u6240\u5C5E\u603B\u7EBF input\u2192busGain\u2192analyser\u2192master\uFF1B\u8DDD\u79BB\u6A21\u578B\u53C2\u6570\u4E0B\u53D1", async () => {
     await engine.resume();
     engine.setSpatialSettings({
       distanceModel: "exponential",
@@ -872,8 +1186,7 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     });
     const track = baseTrack();
     await engine.ensureTrack(track);
-    const voices = engine.voices;
-    const v = voices.get("t1");
+    const v = voicesOf(engine).get("t1");
     assert.equal(v.panner.panningModel, "HRTF");
     assert.equal(v.panner.distanceModel, "exponential");
     assert.equal(v.panner.refDistance, 2);
@@ -882,36 +1195,36 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     assert.ok(Math.abs(v.panner.positionX.value - 2) < 1e-9);
     assert.ok(v.source.connects.some((c) => c.node === v.trackGain));
     assert.ok(v.trackGain.connects.some((c) => c.node === v.panner));
-    const soloBus = engine.soloBus;
-    assert.ok(v.panner.connects.some((c) => c.node === soloBus));
+    const bus = busNodesOf(engine).get(DEFAULT_BUS_ID2);
+    assert.ok(v.panner.connects.some((c) => c.node === bus.input));
+    assert.ok(bus.input.connects.some((c) => c.node === bus.gain));
+    assert.ok(bus.gain.connects.some((c) => c.node === bus.analyser));
+    const master = engine.masterGain;
+    assert.ok(bus.analyser.connects.some((c) => c.node === master));
   });
-  it("\u9759\u97F3\u771F\u5B9E\u628A trackGain \u7F6E 0\uFF1B\u72EC\u594F\u628A\u975E\u72EC\u594F\u58F0\u8F68\u5207\u5230 muteBus", async () => {
+  it("\u9759\u97F3\u771F\u5B9E\u628A trackGain \u7F6E 0\uFF1B\u72EC\u594F\u628A\u975E\u72EC\u594F\u58F0\u8F68\u5207\u5230\u6240\u5C5E\u603B\u7EBF\u7684 muteSink", async () => {
     await engine.resume();
     const a = baseTrack({ id: "a" });
     const b = baseTrack({ id: "b", position: { x: -2, y: 0, z: 0 } });
     await engine.ensureTrack(a);
     await engine.ensureTrack(b);
-    const voices = engine.voices;
-    const muteBus = engine.muteBus;
+    const voices = voicesOf(engine);
+    const bus = busNodesOf(engine).get(DEFAULT_BUS_ID2);
     engine.syncTracks([{ ...a, muted: true }, b]);
     assert.equal(voices.get("a").trackGain.gain.value, 0);
     assert.equal(voices.get("b").trackGain.gain.value, 0.8);
     engine.syncTracks([{ ...a, muted: true }, { ...b, solo: true }]);
-    assert.ok(voices.get("a").panner.connects.some((c) => c.node === muteBus));
-    assert.ok(
-      voices.get("b").panner.connects.every((c) => c.node !== muteBus)
-    );
+    assert.ok(voices.get("a").panner.connects.some((c) => c.node === bus.muteSink));
+    assert.ok(voices.get("b").panner.connects.every((c) => c.node !== bus.muteSink));
     engine.syncTracks([{ ...a, muted: true }, b]);
-    assert.ok(voices.get("a").panner.connects.some((c) => c.node === muteBus));
-    assert.ok(
-      voices.get("a").panner.connects.every((c) => c.node === muteBus)
-    );
+    assert.ok(voices.get("a").panner.connects.some((c) => c.node === bus.muteSink));
+    assert.ok(voices.get("a").panner.connects.every((c) => c.node === bus.muteSink));
   });
   it("\u79FB\u52A8\u58F0\u6E90\u53EA\u5199 AudioParam\uFF0C\u7EDD\u4E0D stop/start source\uFF08\u4E0D\u91CD\u542F\u97F3\u8F68\uFF09", async () => {
     await engine.resume();
     const t = baseTrack();
     await engine.playTrack(t);
-    const v = engine.voices.get("t1");
+    const v = voicesOf(engine).get("t1");
     const startsBefore = v.source.started.length;
     const stopsBefore = v.source.stopped;
     for (let i = 0; i < 10; i++) {
@@ -933,17 +1246,19 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     ctx.currentTime = 0.3;
     engine.pauseTrack(t);
     await engine.playTrack({ ...t });
-    const v = engine.voices.get("t1");
+    const v = voicesOf(engine).get("t1");
     const last = v.source.started[v.source.started.length - 1];
     assert.ok(Math.abs(last.offset - 0.3) < 1e-6);
   });
-  it("\u603B\u7EBF\u4E0E\u4E3B\u589E\u76CA\u771F\u5B9E\u5199\u5165\u5BF9\u5E94 GainNode", async () => {
+  it("\u603B\u7EBF\u589E\u76CA\u4E0E\u4E3B\u589E\u76CA\u771F\u5B9E\u5199\u5165\u5BF9\u5E94 GainNode\uFF1B\u4E3B\u8F93\u51FA\u786E\u5B9E\u8FDE\u5411 destination", async () => {
     await engine.resume();
-    engine.setBusGain(0.42);
+    const routing = createDefaultRouting2();
+    routing.buses[0].gain = 0.42;
+    engine.setRouting(routing);
     engine.setMasterGain(0.71);
-    const bus = engine.busGain;
+    const bus = busNodesOf(engine).get(DEFAULT_BUS_ID2);
     const master = engine.masterGain;
-    assert.ok(Math.abs(bus.gain.value - 0.42) < 1e-9);
+    assert.ok(Math.abs(bus.gain.gain.value - 0.42) < 1e-9);
     assert.ok(Math.abs(master.gain.value - 0.71) < 1e-9);
     const analyser = engine.analyser;
     const destination = engine.ctx.destination;
@@ -956,13 +1271,155 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     await assert.rejects(engine.ensureTrack(bad), (err) => err instanceof DecodeError2);
     const good = baseTrack({ id: "good" });
     await engine.ensureTrack(good);
-    const voices = engine.voices;
-    assert.ok(voices.has("good"));
+    assert.ok(voicesOf(engine).has("good"));
   });
   it("\u5185\u7F6E\u6837\u4F8B\u7F13\u51B2\u53EF\u7ECF\u5F15\u64CE\u5408\u6210\uFF0C\u65F6\u957F\u4E0E\u58F0\u9053\u7B26\u5408\u9884\u671F", async () => {
     await engine.resume();
     const buf = createSampleBuffer2(engine.ctx, "pulse");
     assert.equal(buf.numberOfChannels, 1);
     assert.ok(Math.abs(buf.duration - 1.6) < 1e-6);
+  });
+  it("\u4E24\u6761\u58F0\u6E90\u5206\u522B\u8FDB\u5165\u4E24\u6761\u603B\u7EBF\uFF1A\u8C03\u6574\u4E00\u6761\u603B\u7EBF\u589E\u76CA\u53EA\u5F71\u54CD\u8BE5\u603B\u7EBF\u8282\u70B9", async () => {
+    await engine.resume();
+    const { routing, busB } = twoBusRouting();
+    engine.setRouting(routing);
+    const a = baseTrack({ id: "a", busId: DEFAULT_BUS_ID2 });
+    const b = baseTrack({ id: "b", busId: busB, position: { x: -2, y: 0, z: 0 } });
+    await engine.ensureTrack(a);
+    await engine.ensureTrack(b);
+    const voices = voicesOf(engine);
+    const busA = busNodesOf(engine).get(DEFAULT_BUS_ID2);
+    const busBNodes = busNodesOf(engine).get(busB);
+    assert.ok(voices.get("a").panner.connects.some((c) => c.node === busA.input));
+    assert.ok(voices.get("b").panner.connects.some((c) => c.node === busBNodes.input));
+    const master = engine.masterGain;
+    assert.ok(busA.analyser.connects.some((c) => c.node === master));
+    assert.ok(busBNodes.analyser.connects.some((c) => c.node === master));
+    const r2 = {
+      ...routing,
+      buses: routing.buses.map((x) => x.id === busB ? { ...x, gain: 0.3 } : x)
+    };
+    engine.setRouting(r2);
+    assert.ok(Math.abs(busBNodes.gain.gain.value - 0.3) < 1e-9);
+    assert.ok(Math.abs(busA.gain.gain.value - 1) < 1e-9);
+  });
+  it("\u603B\u7EBF\u72EC\u594F\uFF1A\u5176\u4ED6\u603B\u7EBF\u6709\u6548\u589E\u76CA\u4E3A 0\uFF1B\u88AB\u72EC\u594F\u603B\u7EBF\u5185\u539F\u672C\u9759\u97F3\u7684\u8F68\u4ECD\u4FDD\u6301\u9759\u97F3", async () => {
+    await engine.resume();
+    const { routing, busB } = twoBusRouting();
+    engine.setRouting(routing);
+    const mutedInA = baseTrack({ id: "m", busId: DEFAULT_BUS_ID2, muted: true });
+    const normalInA = baseTrack({ id: "a", busId: DEFAULT_BUS_ID2 });
+    const inB = baseTrack({ id: "b", busId: busB });
+    await engine.ensureTrack(mutedInA);
+    await engine.ensureTrack(normalInA);
+    await engine.ensureTrack(inB);
+    engine.syncTracks([mutedInA, normalInA, inB]);
+    const soloRouting = {
+      ...routing,
+      buses: routing.buses.map(
+        (x) => x.id === DEFAULT_BUS_ID2 ? { ...x, solo: true } : x
+      )
+    };
+    engine.setRouting(soloRouting);
+    const busA = busNodesOf(engine).get(DEFAULT_BUS_ID2);
+    const busBNodes = busNodesOf(engine).get(busB);
+    assert.ok(Math.abs(busA.gain.gain.value - 1) < 1e-9, "\u72EC\u594F\u603B\u7EBF\u4FDD\u6301\u589E\u76CA");
+    assert.equal(busBNodes.gain.gain.value, 0, "\u975E\u72EC\u594F\u603B\u7EBF\u5728\u771F\u5B9E\u94FE\u8DEF\u4E0A\u589E\u76CA\u4E3A 0");
+    const voices = voicesOf(engine);
+    assert.equal(voices.get("m").trackGain.gain.value, 0);
+    assert.ok(voices.get("m").panner.connects.every((c) => c.node === busA.muteSink));
+    assert.ok(voices.get("a").panner.connects.some((c) => c.node === busA.input));
+  });
+  it("\u64AD\u653E\u4E2D\u8FC1\u79FB\u603B\u7EBF\uFF1Asource \u4E0D\u91CD\u542F\u3001\u4E0D\u505C\u6B62\uFF0Cpanner \u4F4D\u7F6E\u4E0D\u53D8\uFF0C\u4EC5\u6539\u63A5\u5230\u65B0\u603B\u7EBF", async () => {
+    await engine.resume();
+    const { routing, busB } = twoBusRouting();
+    engine.setRouting(routing);
+    const t = baseTrack({ id: "mv", busId: DEFAULT_BUS_ID2, position: { x: 1.5, y: 0.5, z: -2 } });
+    await engine.playTrack({ ...t, loop: true });
+    const v = voicesOf(engine).get("mv");
+    const startsBefore = v.source.started.length;
+    const stopsBefore = v.source.stopped;
+    const srcBefore = v.source;
+    engine.syncTracks([{ ...t, loop: true, busId: busB }]);
+    const busBNodes = busNodesOf(engine).get(busB);
+    assert.equal(v.source, srcBefore, "source \u8282\u70B9\u672A\u88AB\u66FF\u6362");
+    assert.equal(v.source.started.length, startsBefore, "source \u6CA1\u6709\u518D\u6B21 start\uFF08\u65E0\u91CD\u542F/\u53CC\u91CD\u53D1\u58F0\uFF09");
+    assert.equal(v.source.stopped, stopsBefore, "source \u672A\u88AB stop");
+    assert.ok(v.panner.connects.some((c) => c.node === busBNodes.input), "panner \u5DF2\u6539\u63A5\u5230\u603B\u7EBF B");
+    assert.ok(Math.abs(v.panner.positionX.value - 1.5) < 1e-9);
+    assert.ok(Math.abs(v.panner.positionY.value - 0.5) < 1e-9);
+    assert.ok(Math.abs(v.panner.positionZ.value - -2) < 1e-9);
+  });
+  it("\u5220\u9664\u603B\u7EBF\u540E\u5176\u8282\u70B9\u7EC4\u88AB\u62C6\u9664\uFF0C\u5269\u4F59\u603B\u7EBF\u4E0D\u53D7\u5F71\u54CD", async () => {
+    await engine.resume();
+    const { routing, busB } = twoBusRouting();
+    engine.setRouting(routing);
+    assert.ok(busNodesOf(engine).has(busB));
+    const busBNodes = busNodesOf(engine).get(busB);
+    engine.setRouting(createDefaultRouting2());
+    assert.ok(!busNodesOf(engine).has(busB));
+    assert.ok(busBNodes.gain.disconnected, "\u88AB\u5220\u603B\u7EBF\u7684\u589E\u76CA\u8282\u70B9\u5DF2\u65AD\u5F00");
+    assert.ok(busNodesOf(engine).has(DEFAULT_BUS_ID2));
+  });
+  it("\u603B\u7EBF\u7EA7\u8054\uFF1A\u5B50\u603B\u7EBF analyser \u8F93\u51FA\u63A5\u5230\u7236\u603B\u7EBF input", async () => {
+    await engine.resume();
+    const { routing, busB } = twoBusRouting();
+    const cascaded = {
+      ...routing,
+      buses: routing.buses.map(
+        (b) => b.id === busB ? { ...b, output: DEFAULT_BUS_ID2 } : b
+      )
+    };
+    engine.setRouting(cascaded);
+    const busA = busNodesOf(engine).get(DEFAULT_BUS_ID2);
+    const busBNodes = busNodesOf(engine).get(busB);
+    assert.ok(busBNodes.analyser.connects.some((c) => c.node === busA.input));
+    const master = engine.masterGain;
+    assert.ok(busA.analyser.connects.some((c) => c.node === master));
+  });
+  it("\u6BCF\u6761\u603B\u7EBF\u7684\u5CF0\u503C\u8BFB\u6570\u6765\u81EA\u5404\u81EA\u4E32\u8054\u5728\u94FE\u4E0A\u7684 analyser\uFF08\u975E\u754C\u9762\u8BA1\u7B97\u503C\uFF09", async () => {
+    await engine.resume();
+    const { routing, busB } = twoBusRouting();
+    engine.setRouting(routing);
+    const busA = busNodesOf(engine).get(DEFAULT_BUS_ID2);
+    const busBNodes = busNodesOf(engine).get(busB);
+    busA.analyser.injectedPeak = 0.5;
+    busBNodes.analyser.injectedPeak = 1.2;
+    const seen = [];
+    const off = engine.onBusLevels((lv) => seen.push({ ...lv }));
+    await new Promise((r) => setTimeout(r, 50));
+    off();
+    assert.ok(seen.length > 0, "\u603B\u7EBF\u7535\u5E73\u56DE\u8C03\u88AB\u89E6\u53D1");
+    const last = seen[seen.length - 1];
+    assert.ok(Math.abs(last[DEFAULT_BUS_ID2].l - 0.5) < 1e-6);
+    assert.ok(Math.abs(last[busB].l - 1.2) < 1e-6);
+    assert.equal(last[busB].clipL, true, "B \u603B\u7EBF\u524A\u6CE2\u9501\u5B58");
+    assert.equal(last[DEFAULT_BUS_ID2].clipL, false);
+    engine.clearBusClipLatch(busB);
+    const after = busNodesOf(engine).get(busB);
+    assert.equal(after.clipL, false);
+  });
+  it("\u89E3\u9501\u5931\u8D25\u4E0D\u635F\u574F\u8DEF\u7531\u72B6\u6001\uFF0C\u91CD\u65B0\u89E3\u9501\u540E\u603B\u7EBF\u56FE\u7167\u5E38\u6784\u5EFA", async () => {
+    const { routing, busB } = twoBusRouting();
+    engine.setRouting(routing);
+    const origCtor = g.AudioContext;
+    g.AudioContext = class extends FakeAudioContext {
+      constructor() {
+        super();
+        this.state = "suspended";
+      }
+      async resume() {
+        throw new Error("autoplay policy");
+      }
+    };
+    await assert.rejects(engine.resume());
+    assert.equal(engine.unlock, "failed");
+    assert.deepEqual(engine.getRouting(), routing, "\u8DEF\u7531\u72B6\u6001\u5728\u89E3\u9501\u5931\u8D25\u540E\u4FDD\u6301\u5B8C\u6574");
+    g.AudioContext = origCtor;
+    await engine.resume();
+    assert.equal(engine.unlock, "unlocked");
+    engine.setRouting(engine.getRouting());
+    assert.ok(busNodesOf(engine).has(DEFAULT_BUS_ID2));
+    assert.ok(busNodesOf(engine).has(busB));
   });
 });

@@ -3,30 +3,39 @@
  *
  * 信号链（每条声轨）：
  *   AudioBufferSourceNode ──► [ChannelSplitter 选取单声道]
- *      ──► trackGain ──► PannerNode(HRTF + 明确距离模型) ──► soloBus ──► busGain
- *                                          └（非独奏/静音）──► muteBus(增益0) ──┘
- *                                                                              ▼
- *                                                        masterGain ─► peakWorklet(逐采样峰值/削波)
- *                                                                              ├► AnalyserNode(回退表)
- *                                                                              └► AudioDestination
+ *      ──► trackGain ──► PannerNode(HRTF + 明确距离模型)
+ *          ──► 所属总线 input（可闻）或 muteSink(增益0)（轨级 M/S 路由）
+ *              ──► busGain(总线推子，含总线 M/S 有效增益) ──► busAnalyser(真实链路串联峰值表)
+ *                  ──► 父总线 input 或 masterGain ──► peakWorklet(逐采样峰值/削波)
+ *                                                        ├► AnalyserNode(回退表)
+ *                                                        └► AudioDestination
+ *
+ * 静音/独奏优先级（明确且一致）：
+ *   1) 轨 mute → trackGain=0（真实无声）
+ *   2) 存在轨 solo → 非 solo 轨切到所属总线的 muteSink（真实无声）
+ *   3) 总线 mute → 该总线增益节点=0
+ *   4) 存在总线 solo → 非 solo 总线增益节点=0（被独奏总线内原本静音的轨仍因 1) 保持无声）
+ *   5) 主输出增益串联在链末端
  *
  * 关键约定：
- *  - 移动声源只更新 PannerNode 的 position AudioParam（setTargetAtTime 平滑），
- *    绝不 stop/start 源节点，因此移动不会重启音轨。
- *  - 静音 = trackGain.gain=0；独奏通过 soloBus/muteBus 真实切换路由。
- *  - 峰值/削波在实际输出链末端（destination 之前）由 AudioWorklet 逐采样检测；
- *    Worklet 不可用时回退到 AnalyserNode 时域峰值（同样在输出链上）。
+ *  - 移动声源 / 迁移总线只更新 AudioParam 与 panner 的连接目标，
+ *    绝不 stop/start 源节点，因此播放中调整路由不会重启音轨、方位不跳变。
+ *  - 每条总线与主输出的峰值/削波都来自串联在真实输出链上的表
+ *   （总线用 AnalyserNode 串联分接；主输出优先 AudioWorklet 逐采样，回退 Analyser）。
  *  - AudioContext 必须由用户手势解锁；解码失败逐条声轨以 DecodeError 上报。
  */
 import type {
+  BusLevels,
   LevelState,
   ListenerState,
+  RoutingGraph,
   SpatialSettings,
   Track,
   UnlockState,
 } from '../types';
 import { forwardVector } from './spatial';
 import { createSampleBuffer } from './samples';
+import { DEFAULT_BUS_ID, MASTER_OUTPUT_ID, createDefaultRouting } from './routing';
 
 interface TrackVoice {
   trackId: string;
@@ -34,7 +43,9 @@ interface TrackVoice {
   source: AudioBufferSourceNode;
   trackGain: GainNode;
   panner: PannerNode;
-  /** true = 接在 soloBus（可听见）；false = 接在增益为 0 的 muteBus */
+  /** 当前 panner 实际连接的节点（所属总线的 input 或 muteSink） */
+  routedTo: GainNode | null;
+  /** true = 接在总线可闻输入；false = 接在增益为 0 的 muteSink */
   audiblyRouted: boolean;
   playing: boolean;
   consumed: boolean; // source 是否已 start 过（结束后必须重建才能再播）
@@ -43,8 +54,26 @@ interface TrackVoice {
   duration: number;
 }
 
+/** 一条总线在音频图中的整组节点 */
+interface BusNodes {
+  id: string;
+  /** 可闻输入（轨级 M/S 判定为可闻的 panner 挂到这里） */
+  input: GainNode;
+  /** 增益恒 0 的静音汇（轨级 M/S 判定为不可闻的 panner 挂到这里） */
+  muteSink: GainNode;
+  /** 总线推子（含总线 M/S 有效增益） */
+  gain: GainNode;
+  /** 串联在总线输出上的真实链路峰值表 */
+  analyser: AnalyserNode;
+  timeBuf: Float32Array<ArrayBuffer>;
+  clipL: boolean;
+  clipR: boolean;
+  lastPeak: LevelState;
+}
+
 export type EngineUnlockListener = (state: UnlockState) => void;
 export type EngineLevelListener = (level: LevelState) => void;
+export type EngineBusLevelListener = (levels: BusLevels) => void;
 export type EngineEndedListener = (trackId: string) => void;
 
 export class DecodeError extends Error {
@@ -60,10 +89,9 @@ export class AudioEngine {
   ctx: AudioContext | null = null;
   unlock: UnlockState = 'locked';
 
-  private busGain: GainNode | null = null;
+  private routing: RoutingGraph = createDefaultRouting();
+  private busNodes = new Map<string, BusNodes>();
   private masterGain: GainNode | null = null;
-  private soloBus: GainNode | null = null;
-  private muteBus: GainNode | null = null;
   private analyser: AnalyserNode | null = null;
   private timeDomainBuf: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(8192));
   private peakWorklet: AudioWorkletNode | null = null;
@@ -78,6 +106,7 @@ export class AudioEngine {
 
   private unlockListeners = new Set<EngineUnlockListener>();
   private levelListeners = new Set<EngineLevelListener>();
+  private busLevelListeners = new Set<EngineBusLevelListener>();
   private endedListeners = new Set<EngineEndedListener>();
   private rafHandle = 0;
   private clipLatchL = false;
@@ -95,6 +124,12 @@ export class AudioEngine {
     this.levelListeners.add(fn);
     return () => {
       this.levelListeners.delete(fn);
+    };
+  }
+  onBusLevels(fn: EngineBusLevelListener): () => void {
+    this.busLevelListeners.add(fn);
+    return () => {
+      this.busLevelListeners.delete(fn);
     };
   }
   onEnded(fn: EngineEndedListener): () => void {
@@ -133,6 +168,13 @@ export class AudioEngine {
       this.startMeterLoop();
       void this.ensurePeakWorklet(ctx);
     } catch (err) {
+      // 解锁失败：关闭并丢弃半成品上下文，路由状态（this.routing）与声轨参数不受影响
+      void this.ctx?.close().catch(() => undefined);
+      this.ctx = null;
+      this.busNodes.clear();
+      this.masterGain = null;
+      this.analyser = null;
+      this.peakWorklet = null;
       this.unlock = 'failed';
       this.emitUnlock();
       throw err;
@@ -140,21 +182,16 @@ export class AudioEngine {
   }
 
   private buildGraph(ctx: AudioContext) {
-    this.soloBus = ctx.createGain();
-    this.muteBus = ctx.createGain();
-    this.muteBus.gain.value = 0;
-    this.busGain = ctx.createGain();
     this.masterGain = ctx.createGain();
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 2048;
     this.timeDomainBuf = new Float32Array(new ArrayBuffer(this.analyser.fftSize * 4));
 
-    this.soloBus.connect(this.busGain);
-    this.muteBus.connect(this.busGain);
-    this.busGain.connect(this.masterGain);
     // 先经过 analyser（回退表）；worklet 加载成功后串入 master 与 destination 之间
     this.masterGain.connect(this.analyser);
     this.analyser.connect(ctx.destination);
+    // 按当前路由图建立全部总线节点组
+    this.reconcileBuses();
   }
 
   /**
@@ -239,6 +276,15 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     this.clipLatchR = false;
   }
 
+  /** 清除指定总线的削波锁存 */
+  clearBusClipLatch(busId: string) {
+    const n = this.busNodes.get(busId);
+    if (n) {
+      n.clipL = false;
+      n.clipR = false;
+    }
+  }
+
   private startMeterLoop() {
     const tick = () => {
       if (!this.peakWorklet && this.analyser) {
@@ -262,9 +308,119 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       }
       const p = this.lastPeak;
       this.levelListeners.forEach((fn) => fn({ ...p }));
+
+      // 每条总线：从串联在真实链路上的 AnalyserNode 读取峰值
+      if (this.busNodes.size > 0 && this.busLevelListeners.size > 0) {
+        const levels: BusLevels = {};
+        for (const [id, n] of this.busNodes) {
+          n.analyser.getFloatTimeDomainData(n.timeBuf);
+          let peak = 0;
+          for (let i = 0; i < n.timeBuf.length; i++) {
+            const a = Math.abs(n.timeBuf[i]);
+            if (a > peak) peak = a;
+          }
+          if (peak >= 1) {
+            n.clipL = true;
+            n.clipR = true;
+          }
+          n.lastPeak = { l: peak, r: peak, clipL: n.clipL, clipR: n.clipR };
+          levels[id] = { ...n.lastPeak };
+        }
+        this.busLevelListeners.forEach((fn) => fn(levels));
+      }
       this.rafHandle = requestAnimationFrame(tick);
     };
     this.rafHandle = requestAnimationFrame(tick);
+  }
+
+  // ---------- 路由图 ----------
+
+  /**
+   * 应用新路由图：增删总线节点组、重接总线输出、刷新有效增益，
+   * 并把现有 voice 的 panner 重新挂到所属总线。
+   * 只改连接与 AudioParam，绝不触碰 BufferSource —— 播放中迁移总线不重启、不双重发声。
+   */
+  setRouting(routing: RoutingGraph) {
+    this.routing = routing;
+    if (!this.ctx) return;
+    this.reconcileBuses();
+    for (const v of this.voices.values()) this.routeVoice(v);
+  }
+
+  getRouting(): RoutingGraph {
+    return this.routing;
+  }
+
+  /** 按路由图对齐总线节点组：删旧、建新、重接输出、下发有效增益 */
+  private reconcileBuses() {
+    const ctx = this.ctx;
+    if (!ctx || !this.masterGain) return;
+    const anyBusSolo = this.routing.buses.some((b) => b.solo);
+
+    // 1) 拆除已不存在于图中的总线
+    for (const [id, nodes] of [...this.busNodes]) {
+      if (!this.routing.buses.some((b) => b.id === id)) {
+        nodes.input.disconnect();
+        nodes.muteSink.disconnect();
+        nodes.gain.disconnect();
+        nodes.analyser.disconnect();
+        this.busNodes.delete(id);
+      }
+    }
+    // 2) 为新总线建节点组：input/muteSink → gain → analyser（表串联在真实链上）
+    for (const bus of this.routing.buses) {
+      if (this.busNodes.has(bus.id)) continue;
+      const input = ctx.createGain();
+      const muteSink = ctx.createGain();
+      muteSink.gain.value = 0;
+      const gain = ctx.createGain();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      input.connect(gain);
+      muteSink.connect(gain);
+      gain.connect(analyser);
+      this.busNodes.set(bus.id, {
+        id: bus.id,
+        input,
+        muteSink,
+        gain,
+        analyser,
+        timeBuf: new Float32Array(new ArrayBuffer(analyser.fftSize * 4)),
+        clipL: false,
+        clipR: false,
+        lastPeak: { l: 0, r: 0, clipL: false, clipR: false },
+      });
+    }
+    // 3) 重接每条总线的输出（analyser 下游），并下发有效增益
+    for (const bus of this.routing.buses) {
+      const nodes = this.busNodes.get(bus.id)!;
+      const downstream =
+        bus.output === MASTER_OUTPUT_ID
+          ? this.masterGain
+          : (this.busNodes.get(bus.output)?.input ?? this.masterGain); // 防御：悬空输出落到 master
+      nodes.analyser.disconnect();
+      nodes.analyser.connect(downstream!);
+      const effective = bus.muted ? 0 : bus.gain * (anyBusSolo && !bus.solo ? 0 : 1);
+      nodes.gain.gain.setTargetAtTime(effective, ctx.currentTime, 0.01);
+    }
+  }
+
+  /** 计算 voice 应挂的节点并改接（仅连接变化时才断开重接） */
+  private routeVoice(voice: TrackVoice) {
+    const track = voice.spec;
+    const audible = this.shouldBeAudible(track);
+    const busId = this.busNodes.has(track.busId)
+      ? track.busId
+      : (this.routing.buses[0]?.id ?? DEFAULT_BUS_ID);
+    const nodes = this.busNodes.get(busId);
+    if (!nodes) return;
+    const target = audible ? nodes.input : nodes.muteSink;
+    if (voice.routedTo !== target) {
+      voice.panner.disconnect();
+      voice.panner.connect(target);
+      voice.routedTo = target;
+    }
+    voice.audiblyRouted = audible;
   }
 
   // ---------- 全局参数 ----------
@@ -277,12 +433,6 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       v.panner.refDistance = s.refDistance;
       v.panner.rolloffFactor = s.rolloffFactor;
       v.panner.maxDistance = s.maxDistance;
-    }
-  }
-
-  setBusGain(g: number) {
-    if (this.busGain && this.ctx) {
-      this.busGain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.01);
     }
   }
 
@@ -392,22 +542,22 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     }
     trackGain.connect(panner);
 
-    const audible = this.shouldBeAudible(track);
-    panner.connect(audible ? this.soloBus! : this.muteBus!);
-
     const voice: TrackVoice = {
       trackId: track.id,
       spec: track,
       source,
       trackGain,
       panner,
-      audiblyRouted: audible,
+      routedTo: null,
+      audiblyRouted: false,
       playing: false,
       consumed: false,
       startedAt: 0,
       offset: 0,
       duration: buffer.duration,
     };
+    // 挂到所属总线的 input / muteSink（路由图此时必然已 reconcile 过）
+    this.routeVoice(voice);
 
     source.onended = () => {
       if (!voice.playing) return; // stop() 触发的 onended 忽略
@@ -430,7 +580,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     return true;
   }
 
-  /** 实时参数更新：不触碰 source 节点 —— 移动声源不会重启音轨 */
+  /** 实时参数更新：不触碰 source 节点 —— 移动声源/迁移总线不会重启音轨 */
   private updateVoiceLive(voice: TrackVoice, track: Track) {
     const ctx = this.ctx!;
     const t = ctx.currentTime;
@@ -444,36 +594,14 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
     if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
 
-    const audible = this.shouldBeAudible(track);
-    if (audible !== voice.audiblyRouted) {
-      voice.panner.disconnect();
-      voice.panner.connect(audible ? this.soloBus! : this.muteBus!);
-      voice.audiblyRouted = audible;
-    }
     voice.spec = track;
-  }
-
-  /** 静音/独奏变化：重新评估全部路由（增益本身在 updateVoiceLive 中已设置） */
-  reevaluateRouting(tracks: Track[]) {
-    this.anySolo = tracks.some((t) => t.solo);
-    if (!this.ctx) return;
-    for (const tr of tracks) {
-      const v = this.voices.get(tr.id);
-      if (!v) continue;
-      const audible = this.shouldBeAudible(tr);
-      if (audible !== v.audiblyRouted) {
-        v.panner.disconnect();
-        v.panner.connect(audible ? this.soloBus! : this.muteBus!);
-        v.audiblyRouted = audible;
-      }
-      v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
-      v.spec = tr;
-    }
+    // busId / M/S 可能变化：仅改接 panner 的下游，source 不动
+    this.routeVoice(voice);
   }
 
   /**
-   * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏路由。
-   * 不创建节点、不触碰 source，移动声源不会重启音轨。
+   * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏与总线归属路由。
+   * 不创建节点、不触碰 source，移动声源或迁移总线都不会重启音轨。
    * 尚未创建 voice 的声轨（未解锁/未解码）跳过，由 ensureTrack 负责。
    */
   syncTracks(tracks: Track[]) {
@@ -565,7 +693,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
 
   /**
    * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转）。
-   * 位置移动严禁走此路径。
+   * 位置移动与总线迁移严禁走此路径。
    */
   private replaceVoice(
     old: TrackVoice,
@@ -629,6 +757,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
   dispose() {
     cancelAnimationFrame(this.rafHandle);
     for (const id of [...this.voices.keys()]) this.removeTrack(id);
+    this.busNodes.clear();
     void this.ctx?.close();
     this.ctx = null;
     this.unlock = 'locked';

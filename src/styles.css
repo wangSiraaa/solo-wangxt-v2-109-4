@@ -374,6 +374,88 @@ input[type='range'] {
   }
 }
 
+/* ---------- Bus panel ---------- */
+.bus-panel {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--panel);
+  max-height: 45%;
+  overflow: auto;
+  flex-shrink: 0;
+}
+.bus-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.bus-panel-title {
+  font-weight: 700;
+  font-size: 12px;
+}
+.bus-row {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.bus-row.muted-bus {
+  opacity: 0.75;
+}
+.bus-row-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.bus-name {
+  flex: 1;
+  min-width: 0;
+  background: #0d1118;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 3px 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.bus-members {
+  font-size: 10px;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.bus-output {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.bus-output select,
+.track-bus select {
+  flex: 1;
+  background: #0d1118;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 3px 6px;
+  font-size: 11px;
+}
+.bus-meter .meter {
+  padding: 4px 6px;
+}
+.track-bus {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 /* ---------- Track list ---------- */
 .track-list {
   flex: 1;

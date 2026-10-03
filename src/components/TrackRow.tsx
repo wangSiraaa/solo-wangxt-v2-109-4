@@ -139,6 +139,20 @@ export function TrackRow({ track, api }: Props) {
         <span className="gain-readout">{gainToDb(track.muted ? 0 : track.gain)}</span>
       </div>
 
+      <label className="track-bus" title="该轨归属的本地监听总线（迁移不重启播放）">
+        <span>总线</span>
+        <select
+          value={track.busId}
+          onChange={(e) => api.moveTrackToBus(track.id, e.target.value)}
+        >
+          {api.doc.routing.buses.map((b) => (
+            <option key={b.id} value={b.id}>
+              {b.name}
+            </option>
+          ))}
+        </select>
+      </label>
+
       <div
         className="track-progress"
         onClick={(e) => {

@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
+  BusLevels,
   LevelState,
   ListenerState,
   NamedProject,
   ProjectDoc,
+  RoutingGraph,
   SourceType,
   SpatialSettings,
   Track,
@@ -11,6 +13,8 @@ import type {
 } from '../types';
 import { engine } from '../lib/engineInstance';
 import { DecodeError } from '../lib/audioEngine';
+import * as routingOps from '../lib/routing';
+import { RoutingError, createDefaultRouting, normalizeDoc } from '../lib/routing';
 import * as idb from '../lib/idb';
 import { SAMPLE_LABELS } from '../lib/samples';
 
@@ -38,7 +42,7 @@ function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${counter}`;
 }
 
-function sampleTrack(type: Exclude<SourceType, 'file'>, index: number): Track {
+function sampleTrack(type: Exclude<SourceType, 'file'>, index: number, busId: string): Track {
   const presets: Record<Exclude<SourceType, 'file'>, Partial<Track> & { position: Track['position'] }> = {
     pulse: { position: { x: -3, y: 0, z: 0 }, loop: true },
     tone: { position: { x: 3, y: 0, z: 0 }, loop: true },
@@ -53,6 +57,7 @@ function sampleTrack(type: Exclude<SourceType, 'file'>, index: number): Track {
     loop: p.loop ?? true,
     muted: false,
     solo: false,
+    busId,
     gain: 0.9,
     channel: 0,
     color: COLORS[index % COLORS.length],
@@ -63,11 +68,11 @@ function sampleTrack(type: Exclude<SourceType, 'file'>, index: number): Track {
 
 function emptyDoc(): ProjectDoc {
   return {
-    version: 1,
+    version: 2,
     tracks: [],
     listener: { ...DEFAULT_LISTENER, position: { ...DEFAULT_LISTENER.position } },
     spatial: { ...DEFAULT_SPATIAL },
-    busGain: 1,
+    routing: createDefaultRouting(),
     masterGain: 0.9,
     savedAt: 0,
   };
@@ -79,6 +84,7 @@ export interface WorkbenchApi {
   unlockError: string | null;
   playingIds: Set<string>;
   levels: LevelState;
+  busLevels: BusLevels;
   selectedId: string | null;
   projects: NamedProject[];
   loadedProjectId: string | null;
@@ -98,8 +104,15 @@ export interface WorkbenchApi {
       | { position: Partial<ListenerState['position']> },
   ) => void;
   setSpatial: (patch: Partial<SpatialSettings>) => void;
-  setBusGain: (v: number) => void;
   setMasterGain: (v: number) => void;
+  addBus: (name?: string) => boolean;
+  removeBus: (busId: string) => boolean;
+  renameBus: (busId: string, name: string) => boolean;
+  setBusGain: (busId: string, gain: number) => void;
+  toggleBusMute: (busId: string) => void;
+  toggleBusSolo: (busId: string) => void;
+  setBusOutput: (busId: string, output: string) => boolean;
+  moveTrackToBus: (trackId: string, busId: string) => boolean;
   play: (id: string) => Promise<void>;
   pause: (id: string) => void;
   stop: (id: string) => void;
@@ -108,6 +121,7 @@ export interface WorkbenchApi {
   playAll: () => Promise<void>;
   stopAll: () => void;
   clearClips: () => void;
+  clearBusClip: (busId: string) => void;
   saveProjectAs: (name: string) => Promise<void>;
   loadProject: (id: string) => Promise<void>;
   deleteProject: (id: string) => Promise<void>;
@@ -121,6 +135,7 @@ export function useWorkbench(): WorkbenchApi {
   const [unlockError, setUnlockError] = useState<string | null>(null);
   const [playingIds, setPlayingIds] = useState<Set<string>>(new Set());
   const [levels, setLevels] = useState<LevelState>({ l: 0, r: 0, clipL: false, clipR: false });
+  const [busLevels, setBusLevels] = useState<BusLevels>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [projects, setProjects] = useState<NamedProject[]>([]);
   const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
@@ -144,11 +159,12 @@ export function useWorkbench(): WorkbenchApi {
         if (cancelled) return;
         if (list) setProjects(list);
         if (session) {
-          // 恢复全部参数，但播放状态一律归零（不擅自自动播放）。
+          // 恢复全部参数（含路由图，v1 文档自动迁移/修复），但播放状态一律归零。
           // 文件轨标记 pending，待音频解锁后重新注入 Blob 解码。
+          const restored = normalizeDoc(session);
           setDoc({
-            ...session,
-            tracks: session.tracks.map((t) => ({
+            ...restored,
+            tracks: restored.tracks.map((t) => ({
               ...t,
               status: 'pending',
               errorMessage: undefined,
@@ -169,6 +185,7 @@ export function useWorkbench(): WorkbenchApi {
   // ---------- 引擎事件订阅 ----------
   useEffect(() => engine.onUnlock(setUnlock), []);
   useEffect(() => engine.onLevels(setLevels), []);
+  useEffect(() => engine.onBusLevels(setBusLevels), []);
 
   useEffect(() => {
     return engine.onEnded((trackId) => {
@@ -190,16 +207,18 @@ export function useWorkbench(): WorkbenchApi {
     engine.setListener(doc.listener);
   }, [doc.listener]);
 
+  // 路由图（总线增删/成员归属/总线 M/S/增益/输出级联）整体下发：
+  // 引擎只改连接与 AudioParam，不重建 BufferSource
   useEffect(() => {
-    engine.setBusGain(doc.busGain);
-  }, [doc.busGain]);
+    engine.setRouting(doc.routing);
+  }, [doc.routing]);
 
   useEffect(() => {
     engine.setMasterGain(doc.masterGain);
   }, [doc.masterGain]);
 
-  // 声轨任意参数（位置/增益/静音/独奏/loop）实时同步到音频链：
-  // syncTracks 只更新 AudioParam 与路由，不重建 source，移动不会重启音轨
+  // 声轨任意参数（位置/增益/静音/独奏/loop/归属总线）实时同步到音频链：
+  // syncTracks 只更新 AudioParam 与路由，不重建 source，移动/换总线不会重启音轨
   useEffect(() => {
     engine.syncTracks(doc.tracks);
   }, [doc.tracks]);
@@ -212,7 +231,7 @@ export function useWorkbench(): WorkbenchApi {
       // 先把当前全局参数推入音频图（恢复工程后这些 effect 不会因解锁而重跑）
       engine.setSpatialSettings(docRef.current.spatial);
       engine.setListener(docRef.current.listener);
-      engine.setBusGain(docRef.current.busGain);
+      engine.setRouting(docRef.current.routing);
       engine.setMasterGain(docRef.current.masterGain);
 
       // 注入文件 Blob
@@ -303,13 +322,114 @@ export function useWorkbench(): WorkbenchApi {
     }
   }, []);
 
+  // ---------- 路由事务 ----------
+  //
+  // 所有总线/成员变更共用一个事务入口：
+  //  1. 基于当前快照调用纯函数事务（失败抛 RoutingError，不产生任何部分结果）；
+  //  2. 成功才提交 setDoc，并带版本守卫：基线版本已被推进时在最新状态上重放
+  //     该纯函数事务（op 只依赖传入的 routing/tracks，可安全重放），重放失败则放弃。
+  // 失败路径完全不触碰 doc —— 旧图原样保留，即原子回滚。
+  const routingTxn = useCallback(
+    (op: (routing: RoutingGraph, tracks: Track[]) => routingOps.RoutingTxn): boolean => {
+      const base = docRef.current;
+      let result: routingOps.RoutingTxn;
+      try {
+        result = op(base.routing, base.tracks);
+      } catch (err) {
+        setGlobalError(
+          err instanceof RoutingError ? err.message : `路由操作失败：${String(err)}`,
+        );
+        return false;
+      }
+      if (result.routing === base.routing && result.tracks === base.tracks) return true; // 无操作
+      const baseVersion = base.routing.version;
+      setDoc((cur) => {
+        if (cur.routing.version === baseVersion) {
+          return { ...cur, routing: result.routing, tracks: result.tracks };
+        }
+        // 版本守卫：基线已被其他事务推进 → 在最新图上重放，避免覆盖他人提交
+        try {
+          const replayed = op(cur.routing, cur.tracks);
+          return { ...cur, routing: replayed.routing, tracks: replayed.tracks };
+        } catch {
+          return cur; // 重放不再合法（如目标已被删除）→ 放弃本次，保留旧图
+        }
+      });
+      return true;
+    },
+    [],
+  );
+
+  const addBus = useCallback(
+    (name?: string) => routingTxn((r, t) => routingOps.addBus(r, t, name)),
+    [routingTxn],
+  );
+
+  const removeBus = useCallback(
+    (busId: string) => routingTxn((r, t) => routingOps.removeBus(r, t, busId)),
+    [routingTxn],
+  );
+
+  const renameBus = useCallback(
+    (busId: string, name: string) => routingTxn((r, t) => routingOps.patchBus(r, t, busId, { name })),
+    [routingTxn],
+  );
+
+  const setBusGain = useCallback(
+    (busId: string, gain: number) => {
+      routingTxn((r, t) => routingOps.patchBus(r, t, busId, { gain }));
+    },
+    [routingTxn],
+  );
+
+  const toggleBusMute = useCallback(
+    (busId: string) => {
+      // 在事务闭包内读取最新状态，保证版本守卫重放时语义正确
+      routingTxn((r, t) => {
+        const bus = r.buses.find((b) => b.id === busId);
+        if (!bus) throw new RoutingError('总线不存在');
+        return routingOps.patchBus(r, t, busId, { muted: !bus.muted });
+      });
+    },
+    [routingTxn],
+  );
+
+  const toggleBusSolo = useCallback(
+    (busId: string) => {
+      routingTxn((r, t) => {
+        const bus = r.buses.find((b) => b.id === busId);
+        if (!bus) throw new RoutingError('总线不存在');
+        return routingOps.patchBus(r, t, busId, { solo: !bus.solo });
+      });
+    },
+    [routingTxn],
+  );
+
+  const setBusOutput = useCallback(
+    (busId: string, output: string) =>
+      routingTxn((r, t) => routingOps.setBusOutput(r, t, busId, output)),
+    [routingTxn],
+  );
+
+  const moveTrackToBus = useCallback(
+    (trackId: string, busId: string) =>
+      routingTxn((r, t) => routingOps.moveTrackToBus(r, t, trackId, busId)),
+    [routingTxn],
+  );
+
+  /** 新声轨默认挂到首条总线 */
+  const defaultBusId = useCallback(
+    () => docRef.current.routing.buses[0]?.id ?? routingOps.DEFAULT_BUS_ID,
+    [],
+  );
+
   const addSample = useCallback(async (type: Exclude<SourceType, 'file'>) => {
     if (engine.unlock !== 'unlocked') {
       // 解锁失败时不继续；用户在遮罩上能看到明确错误
       await unlockAudio();
       if ((engine.unlock as UnlockState) !== 'unlocked') return;
     }
-    const track = sampleTrack(type, docRef.current.tracks.length);
+    const track = sampleTrack(type, docRef.current.tracks.length, defaultBusId());
     setDoc((d) => ({ ...d, tracks: [...d.tracks, track] }));
     if (engine.unlock === 'unlocked') {
       try {
@@ -326,7 +446,7 @@ export function useWorkbench(): WorkbenchApi {
       }
     }
     setSelectedId(track.id);
-  }, [unlock, unlockAudio]);
+  }, [unlock, unlockAudio, defaultBusId]);
 
   const addFiles = useCallback(
     async (files: FileList | File[]) => {
@@ -349,6 +469,7 @@ export function useWorkbench(): WorkbenchApi {
           loop: false,
           muted: false,
           solo: false,
+          busId: defaultBusId(),
           gain: 0.9,
           channel: 0,
           color: COLORS[idx % COLORS.length],
@@ -399,7 +520,7 @@ export function useWorkbench(): WorkbenchApi {
         }
       }
     },
-    [unlock, unlockAudio],
+    [unlock, unlockAudio, defaultBusId],
   );
 
   const removeTrack = useCallback(async (id: string) => {
@@ -470,10 +591,6 @@ export function useWorkbench(): WorkbenchApi {
 
   const setSpatial = useCallback((patch: Partial<SpatialSettings>) => {
     setDoc((d) => ({ ...d, spatial: { ...d.spatial, ...patch } }));
-  }, []);
-
-  const setBusGain = useCallback((v: number) => {
-    setDoc((d) => ({ ...d, busGain: v }));
   }, []);
 
   const setMasterGain = useCallback((v: number) => {
@@ -575,6 +692,15 @@ export function useWorkbench(): WorkbenchApi {
     setLevels((l) => ({ ...l, clipL: false, clipR: false }));
   }, []);
 
+  const clearBusClip = useCallback((busId: string) => {
+    engine.clearBusClipLatch(busId);
+    setBusLevels((prev) => {
+      const cur = prev[busId];
+      if (!cur) return prev;
+      return { ...prev, [busId]: { ...cur, clipL: false, clipR: false } };
+    });
+  }, []);
+
   // ---------- 具名工程 ----------
   const refreshProjects = useCallback(async () => {
     setProjects(await idb.listProjects());
@@ -604,12 +730,14 @@ export function useWorkbench(): WorkbenchApi {
       // 先拆除当前声轨节点
       for (const t of docRef.current.tracks) engine.removeTrack(t.id);
       setPlayingIds(new Set());
+      // 载入即规整：v1 迁移、修复悬空成员/环，播放一律停止
+      const normalized = normalizeDoc(p.doc);
       const restored: ProjectDoc = {
-        ...p.doc,
-        tracks: p.doc.tracks.map((t) => ({
+        ...normalized,
+        tracks: normalized.tracks.map((t) => ({
           ...t,
           // 内置样例可重建；文件声轨等待 Blob 注入解码；不自动播放
-          status: t.sourceType === 'file' ? 'pending' : 'pending',
+          status: 'pending',
         })),
       };
       setDoc(restored);
@@ -618,6 +746,7 @@ export function useWorkbench(): WorkbenchApi {
       setSelectedId(null);
       // 若已解锁，走一遍解锁同步逻辑（手动触发：状态不变，effect 不会重跑）
       if (engine.unlock === 'unlocked') {
+        engine.setRouting(restored.routing);
         for (const t of restored.tracks) {
           if (t.sourceType === 'file' && t.blobKey) {
             const blob = await idb.getBlob(t.blobKey);
@@ -673,6 +802,7 @@ export function useWorkbench(): WorkbenchApi {
       unlockError,
       playingIds,
       levels,
+      busLevels,
       selectedId,
       projects,
       loadedProjectId,
@@ -688,8 +818,15 @@ export function useWorkbench(): WorkbenchApi {
       moveTrack,
       setListener,
       setSpatial,
-      setBusGain,
       setMasterGain,
+      addBus,
+      removeBus,
+      renameBus,
+      setBusGain,
+      toggleBusMute,
+      toggleBusSolo,
+      setBusOutput,
+      moveTrackToBus,
       play,
       pause,
       stop,
@@ -698,6 +835,7 @@ export function useWorkbench(): WorkbenchApi {
       playAll,
       stopAll,
       clearClips,
+      clearBusClip,
       saveProjectAs,
       loadProject,
       deleteProject,
@@ -710,6 +848,7 @@ export function useWorkbench(): WorkbenchApi {
       unlockError,
       playingIds,
       levels,
+      busLevels,
       selectedId,
       projects,
       loadedProjectId,
@@ -725,8 +864,15 @@ export function useWorkbench(): WorkbenchApi {
       moveTrack,
       setListener,
       setSpatial,
-      setBusGain,
       setMasterGain,
+      addBus,
+      removeBus,
+      renameBus,
+      setBusGain,
+      toggleBusMute,
+      toggleBusSolo,
+      setBusOutput,
+      moveTrackToBus,
       play,
       pause,
       stop,
@@ -735,6 +881,7 @@ export function useWorkbench(): WorkbenchApi {
       playAll,
       stopAll,
       clearClips,
+      clearBusClip,
       saveProjectAs,
       loadProject,
       deleteProject,

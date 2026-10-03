@@ -9,7 +9,7 @@
 npm install
 npm run dev      # 开发
 npm run build    # 类型检查 + 生产构建
-npm test         # 空间数学/样例/音频图行为测试（25 项）
+npm test         # 空间数学/样例/路由事务/音频图行为测试（45 项）
 ```
 
 ## 坐标系与左右含义（三个视图严格一致）
@@ -27,16 +27,19 @@ npm test         # 空间数学/样例/音频图行为测试（25 项）
 
 ```
 BufferSource →(立体声文件经 ChannelSplitter 选原始 L/R 声道)
-  → trackGain(Mute) → PannerNode(HRTF, inverse/linear/exponential 明确距离模型)
-  → soloBus / muteBus(0) → busGain(总线) → masterGain(主输出)
+  → trackGain(轨 Mute) → PannerNode(HRTF, inverse/linear/exponential 明确距离模型)
+  → 所属总线 input / muteSink(0)（轨级 M/S 路由）
+  → busGain(总线推子，含总线 M/S 有效增益) → busAnalyser(真实链路串联峰值表)
+  → 父总线 input 或 masterGain(主输出)
   → PeakMeter(AudioWorklet 逐采样峰值+削波) → destination
 ```
 
-- **移动声源只更新 PannerNode 的 position AudioParam（setTargetAtTime 平滑），不 stop/start，音轨不重启**
-- 静音 = 该轨增益 0；独奏时非独奏轨物理切到增益 0 的 muteBus，真实不可闻
-- 总线增益、主增益都在实际输出链上
-- 峰值表串联在 master 与 destination 之间逐采样检测（Worklet 不可用时回退 Analyser 时域块），≥1.0 锁存 CLIP
-- `AudioContext` 必须在用户手势中解锁；解锁失败有独立错误态。文件解码失败按轨标记“解码失败”，不影响其他轨
+- **移动声源 / 迁移总线只更新 AudioParam 与 PannerNode 的连接目标，不 stop/start，音轨不重启、方位不跳变**
+- 静音/独奏优先级（明确且一致）：轨 mute → 轨 solo（非独奏轨切到所属总线零增益 muteSink）→ 总线 mute → 总线 solo（其他总线增益置 0；被独奏总线内原本静音的轨仍无声）→ 主输出增益
+- 总线可级联（output 指向主输出或另一条总线），路由图必须无环；每条轨恰好归属一条有效总线
+- 所有总线/成员变更走**纯函数事务**：先整体校验再提交，版本号单调递增；循环路由、删除仍有成员的总线等操作原子失败并保留旧图
+- 每条总线与主输出的峰值/削波都来自串联在真实输出链上的表（总线用 AnalyserNode 串联分接；主输出优先 AudioWorklet 逐采样，回退 Analyser），≥1.0 锁存 CLIP
+- `AudioContext` 必须在用户手势中解锁；解锁失败有独立错误态且不损坏路由状态。文件解码失败按轨标记“解码失败”，不影响其他轨
 - 立体声文件通过 ChannelSplitter 显式选择**文件原始左/右声道**作为 HRTF 单声道输入
 
 ## 内置检查样例（全部本地合成）
@@ -51,10 +54,12 @@ BufferSource →(立体声文件经 ChannelSplitter 选原始 L/R 声道)
 
 - 3D：拖彩色球移动声源、拖白色听者移动位置；右侧面板精确编辑坐标
 - 2D：俯视图拖点移动、拖听者前向圆环手柄旋转朝向
-- 每轨有播放/暂停/停止/进度跳转/循环/M/S/增益与距离增益读数
+- 每轨有播放/暂停/停止/进度跳转/循环/M/S/增益、**归属总线选择**与距离增益读数
+- 总线面板：新增/重命名/删除总线，每条总线有增益、M/S、输出级联选择与真实链路峰值表
 
 ## 持久化
 
-- 布局与参数防抖自动写入 IndexedDB `session`；文件 Blob 存独立 `blobs` 仓
+- 布局、参数与**总线路由图**（含版本号）防抖自动写入 IndexedDB `session`；文件 Blob 存独立 `blobs` 仓
 - 可“另存工程”为多条具名工程
 - **重载/载入工程只恢复参数，播放一律停止，绝不自动播放**；文件轨在下次解锁后重新本地解码
+- v1 旧文档（单一总线增益）自动迁移为默认总线；损坏的悬空成员/循环级联在载入时修复

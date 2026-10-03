@@ -7,6 +7,7 @@ import { Inspector } from './components/Inspector';
 import { ListenerPanel } from './components/ListenerPanel';
 import { SpatialPanel } from './components/SpatialPanel';
 import { MasterBar } from './components/MasterBar';
+import { BusPanel } from './components/BusPanel';
 import { ProjectBar } from './components/ProjectBar';
 import { UnlockOverlay } from './components/UnlockOverlay';
 import type { Vec3 } from './types';
@@ -53,6 +54,7 @@ export default function App() {
       <div className="layout">
         <aside className="sidebar left">
           <MasterBar api={api} />
+          <BusPanel api={api} />
           <div className="track-list">
             {api.doc.tracks.length === 0 && (
               <div className="empty-hint">

@@ -20,6 +20,8 @@ export interface Track {
   loop: boolean;
   muted: boolean;
   solo: boolean;
+  /** 所属本地监听总线；每条轨必须恰好归属一条有效总线 */
+  busId: string;
   /** 推子线性增益（0..1.5），真实进入音频链 */
   gain: number;
   /** 立体声文件选用的输入声道：HRTF 需要单声道输入 */
@@ -62,12 +64,35 @@ export interface SpatialSettings {
   hrtfIR: 'none';
 }
 
+/**
+ * 本地监听总线。总线可级联：output 指向 'master' 或另一条总线 id。
+ * 路由图必须是无环图（DAG），由 routing.ts 的事务函数保证。
+ */
+export interface Bus {
+  id: string;
+  name: string;
+  /** 推子线性增益（0..1.5），真实进入音频链 */
+  gain: number;
+  muted: boolean;
+  solo: boolean;
+  /** 输出目标：MASTER_OUTPUT_ID 或另一条总线的 id */
+  output: string;
+  color: string;
+}
+
+export interface RoutingGraph {
+  /** 单调递增版本号：每次事务性变更 +1，用于持久化一致性校验 */
+  version: number;
+  buses: Bus[];
+}
+
 export interface ProjectDoc {
-  version: 1;
+  version: 2;
   tracks: Track[];
   listener: ListenerState;
   spatial: SpatialSettings;
-  busGain: number;
+  /** 总线路由图（含每条总线的增益/静音/独奏/输出） */
+  routing: RoutingGraph;
   masterGain: number;
   savedAt: number;
   name?: string;
@@ -88,6 +113,9 @@ export interface LevelState {
   clipL: boolean;
   clipR: boolean;
 }
+
+/** 每条总线一份真实链路峰值读数（key = busId） */
+export type BusLevels = Record<string, LevelState>;
 
 export type UnlockState = 'locked' | 'unlocking' | 'unlocked' | 'failed';
 

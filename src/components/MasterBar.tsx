@@ -53,18 +53,6 @@ export function MasterBar({ api }: Props) {
       </div>
 
       <div className="master-gains">
-        <label className="gain-fader">
-          <span>总线</span>
-          <input
-            type="range"
-            min={0}
-            max={1.5}
-            step={0.01}
-            value={api.doc.busGain}
-            onChange={(e) => api.setBusGain(Number(e.target.value))}
-          />
-          <b>{gainToDb(api.doc.busGain)}</b>
-        </label>
         <label className="gain-fader master">
           <span>主输出</span>
           <input
