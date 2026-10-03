@@ -2,7 +2,7 @@ import { useCallback, useState } from 'react';
 import { useWorkbench } from './state/useWorkbench';
 import { Scene3DView } from './components/Scene3DView';
 import { Plan2D } from './components/Plan2D';
-import { TrackRow } from './components/TrackRow';
+import { BusPanel } from './components/BusPanel';
 import { Inspector } from './components/Inspector';
 import { ListenerPanel } from './components/ListenerPanel';
 import { SpatialPanel } from './components/SpatialPanel';
@@ -53,30 +53,7 @@ export default function App() {
       <div className="layout">
         <aside className="sidebar left">
           <MasterBar api={api} />
-          <div className="track-list">
-            {api.doc.tracks.length === 0 && (
-              <div className="empty-hint">
-                还没有声轨。
-                <br />
-                导入本地音频，或添加
-                <button className="btn inline" onClick={() => api.addSample('pulse')}>
-                  脉冲
-                </button>
-                /
-                <button className="btn inline" onClick={() => api.addSample('tone')}>
-                  单音
-                </button>
-                /
-                <button className="btn inline" onClick={() => MasterBarAddDuo(api)}>
-                  双声源
-                </button>
-                样例检查方位与同步。
-              </div>
-            )}
-            {api.doc.tracks.map((t) => (
-              <TrackRow key={t.id} track={t} api={api} />
-            ))}
-          </div>
+          <BusPanel api={api} />
         </aside>
 
         <main className="stage">
@@ -114,9 +91,4 @@ export default function App() {
       <UnlockOverlay api={api} />
     </div>
   );
-}
-
-/** 空状态下直接添加一对双声源 */
-function MasterBarAddDuo(api: ReturnType<typeof useWorkbench>) {
-  void api.addSample('duoA').then(() => api.addSample('duoB'));
 }

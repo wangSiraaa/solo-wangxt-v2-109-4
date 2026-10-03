@@ -1,12 +1,5 @@
 /**
  * AudioEngine 图行为测试：使用最小 Web Audio 模拟（无真实音频设备）。
- * 验证：
- *  - 解锁后构建输出链；声轨经过 HRTF PannerNode
- *  - 静音 → trackGain=0；独奏 → 非独奏声轨被切到 muteBus（真实不可闻）
- *  - 移动声源只改变 position AudioParam，不重建 source（不重启音轨）
- *  - 总线/主增益真实进入链路
- *  - 峰值 worklet 不可用时不致命（回退表）
- *  - 解码失败以 DecodeError 单独抛出
  */
 import assert from 'node:assert/strict';
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -47,7 +40,6 @@ class FakeNode {
 class FakeGain extends FakeNode {
   gain = new FakeAudioParam(1);
 }
-class FakeStereoPanner extends FakeNode {}
 class FakeDestination extends FakeNode {}
 
 class FakePanner extends FakeNode {
@@ -59,8 +51,6 @@ class FakePanner extends FakeNode {
   positionX = new FakeAudioParam(0);
   positionY = new FakeAudioParam(0);
   positionZ = new FakeAudioParam(0);
-  positionTimeConstant = 0;
-  orientationX = new FakeAudioParam(1);
   constructor(_ctx: unknown, opts: Record<string, unknown> = {}) {
     super();
     Object.assign(this, opts);
@@ -109,7 +99,6 @@ class FakeSplitter extends FakeNode {
     super();
   }
 }
-class FakeMerger extends FakeNode {}
 
 class FakeListener {
   positionX = new FakeAudioParam(0);
@@ -133,7 +122,6 @@ class FakeAnalyser extends FakeNode {
 class FakeAudioContext {
   state: 'running' | 'suspended' = 'running';
   currentTime = 0;
-  playbackRate = { value: 1 };
   destination = new FakeDestination();
   listener = new FakeListener();
   sampleRate = 48000;
@@ -154,15 +142,8 @@ class FakeAudioContext {
   createChannelSplitter(ch: number) {
     return new FakeSplitter(ch);
   }
-  createChannelMerger(ch: number) {
-    void ch;
-    return new FakeMerger();
-  }
   createAnalyser() {
     return new FakeAnalyser();
-  }
-  createStereoPanner() {
-    return new FakeStereoPanner();
   }
   async resume() {
     this.state = 'running';
@@ -177,21 +158,21 @@ class FakeAudioContext {
 
 const g = globalThis as unknown as Record<string, unknown>;
 g.AudioContext = FakeAudioContext;
-g.requestAnimationFrame = (fn: FrameRequestCallback) => {
-  return setTimeout(() => fn(0), 16) as unknown as number;
-};
+g.requestAnimationFrame = (fn: FrameRequestCallback) => setTimeout(() => fn(0), 16) as unknown as number;
 g.cancelAnimationFrame = (id: number) => clearTimeout(id);
 g.window = globalThis;
 g.PannerNode = FakePanner;
 
 const { AudioEngine, DecodeError } = await import('../src/lib/audioEngine.ts');
 const { createSampleBuffer } = await import('../src/lib/samples.ts');
+const { createDefaultBuses } = await import('../src/lib/routing.ts');
 
 function baseTrack(over: Partial<import('../src/types.ts').Track> = {}) {
   return {
     id: 't1',
     name: 'T',
     sourceType: 'tone' as const,
+    busId: 'bus-a',
     loop: false,
     muted: false,
     solo: false,
@@ -202,6 +183,30 @@ function baseTrack(over: Partial<import('../src/types.ts').Track> = {}) {
     status: 'pending' as const,
     ...over,
   };
+}
+
+function buses() {
+  return createDefaultBuses();
+}
+
+function routeState(tracks: import('../src/types.ts').Track[], overrides: Partial<{ masterGain: number; masterMuted: boolean; buses: ReturnType<typeof buses> }> = {}) {
+  return {
+    buses: overrides.buses ?? buses(),
+    tracks,
+    masterGain: overrides.masterGain ?? 0.9,
+    masterMuted: overrides.masterMuted ?? false,
+  };
+}
+
+type EngineInternals = {
+  voices: Map<string, { source: FakeBufferSource; trackGain: FakeGain; panner: FakePanner; busId: string }>;
+  busNodes: Map<string, { spec: { id: string }; gain: FakeGain; analyser: FakeAnalyser }>;
+  masterGain: FakeGain;
+  masterAnalyser: FakeAnalyser;
+};
+
+function internals(engine: InstanceType<typeof AudioEngine>): EngineInternals {
+  return engine as unknown as EngineInternals;
 }
 
 describe('AudioEngine 图行为（模拟环境）', () => {
@@ -220,18 +225,18 @@ describe('AudioEngine 图行为（模拟环境）', () => {
     assert.equal(engine.unlock, 'unlocked');
     engine.setListener({
       position: { x: 0, y: 0, z: 3 },
-      yaw: Math.PI / 2, // 右转 → forward (+1,0,0)
+      yaw: Math.PI / 2,
       pitch: 0,
       earHeight: 0,
     });
-    const li = engine.ctx!.listener as unknown as FakeListener;
+    const li = engine.ctx!.listener as unknown as { forwardX: FakeAudioParam; forwardZ: FakeAudioParam; upY: FakeAudioParam; positionZ: FakeAudioParam };
     assert.ok(Math.abs(li.forwardX.value - 1) < 1e-6);
     assert.ok(Math.abs(li.forwardZ.value) < 1e-6);
     assert.ok(Math.abs(li.upY.value - 1) < 1e-6);
     assert.ok(Math.abs(li.positionZ.value - 3) < 1e-6);
   });
 
-  it('声轨链路为 source→trackGain→HRTF panner→soloBus→…→destination；距离模型参数下发', async () => {
+  it('声轨链路为 source→trackGain→HRTF panner→所属总线→主输出；距离模型参数下发', async () => {
     await engine.resume();
     engine.setSpatialSettings({
       distanceModel: 'exponential',
@@ -243,68 +248,98 @@ describe('AudioEngine 图行为（模拟环境）', () => {
     });
     const track = baseTrack();
     await engine.ensureTrack(track);
-    const voices = (engine as unknown as { voices: Map<string, { panner: FakePanner; trackGain: FakeGain; source: FakeBufferSource }> }).voices;
-    const v = voices.get('t1')!;
+    const ie = internals(engine);
+    const v = ie.voices.get('t1')!;
     assert.equal(v.panner.panningModel, 'HRTF');
     assert.equal(v.panner.distanceModel, 'exponential');
     assert.equal(v.panner.refDistance, 2);
     assert.equal(v.panner.rolloffFactor, 1.5);
     assert.equal(v.panner.maxDistance, 25);
     assert.ok(Math.abs(v.panner.positionX.value - 2) < 1e-9);
-    // source → gain
     assert.ok(v.source.connects.some((c) => c.node === v.trackGain));
-    // gain → panner
     assert.ok(v.trackGain.connects.some((c) => c.node === v.panner));
-    // panner → soloBus
-    const soloBus = (engine as unknown as { soloBus: FakeGain }).soloBus;
-    assert.ok(v.panner.connects.some((c) => c.node === soloBus));
+    const busA = ie.busNodes.get('bus-a')!;
+    assert.deepEqual(v.panner.connects.map((c) => c.node), [busA.gain]);
+    assert.ok(busA.gain.connects.some((c) => c.node === busA.analyser));
+    assert.ok(busA.analyser.connects.some((c) => c.node === ie.masterGain));
   });
 
-  it('静音真实把 trackGain 置 0；独奏把非独奏声轨切到 muteBus', async () => {
+  it('调整一个总线增益只影响该总线 GainNode，另一总线和主输出保持不变', async () => {
     await engine.resume();
-    const a = baseTrack({ id: 'a' });
-    const b = baseTrack({ id: 'b', position: { x: -2, y: 0, z: 0 } });
+    const a = baseTrack({ id: 'a', busId: 'bus-a' });
+    const b = baseTrack({ id: 'b', busId: 'bus-b', position: { x: -2, y: 0, z: 0 } });
+    engine.syncRouting(routeState([a, b]));
     await engine.ensureTrack(a);
     await engine.ensureTrack(b);
-    const voices = (engine as unknown as {
-      voices: Map<string, { trackGain: FakeGain; panner: FakePanner }>;
-      muteBus: FakeGain;
-    }).voices;
-    const muteBus = (engine as unknown as { muteBus: FakeGain }).muteBus;
-
-    engine.syncTracks([{ ...a, muted: true }, b]);
-    assert.equal(voices.get('a')!.trackGain.gain.value, 0);
-    assert.equal(voices.get('b')!.trackGain.gain.value, 0.8);
-
-    engine.syncTracks([{ ...a, muted: true }, { ...b, solo: true }]);
-    // a 既静音又非独奏 → muteBus；b 独奏 → 留在可闻总线
-    assert.ok(voices.get('a')!.panner.connects.some((c) => c.node === muteBus));
-    assert.ok(
-      voices.get('b')!.panner.connects.every((c) => c.node !== muteBus),
-    );
-
-    // 解除独奏后，a 仍因 muted 留在 muteBus，b 回到 soloBus
-    engine.syncTracks([{ ...a, muted: true }, b]);
-    assert.ok(voices.get('a')!.panner.connects.some((c) => c.node === muteBus));
-    assert.ok(
-      voices.get('a')!.panner.connects.every((c) => c.node === muteBus),
-    );
+    const ie = internals(engine);
+    const nextBuses = buses();
+    nextBuses[0].gain = 0.25;
+    engine.syncRouting(routeState([a, b], { buses: nextBuses }));
+    assert.equal(ie.busNodes.get('bus-a')!.gain.gain.value, 0.25);
+    assert.equal(ie.busNodes.get('bus-b')!.gain.gain.value, 1);
+    assert.equal(ie.masterGain.gain.value, 0.9);
   });
 
-  it('移动声源只写 AudioParam，绝不 stop/start source（不重启音轨）', async () => {
+  it('总线独奏只让其他总线物理静音；独奏总线内原本 M 的轨仍为 0', async () => {
+    await engine.resume();
+    const aMuted = baseTrack({ id: 'a', busId: 'bus-a', muted: true });
+    const b = baseTrack({ id: 'b', busId: 'bus-b', position: { x: -2, y: 0, z: 0 } });
+    engine.syncRouting(routeState([aMuted, b]));
+    await engine.ensureTrack(aMuted);
+    await engine.ensureTrack(b);
+    const ie = internals(engine);
+
+    const soloBuses = buses();
+    soloBuses[0].solo = true;
+    engine.syncRouting(routeState([aMuted, b], { buses: soloBuses }));
+    assert.equal(ie.voices.get('a')!.trackGain.gain.value, 0);
+    assert.equal(ie.voices.get('b')!.trackGain.gain.value, 0);
+
+    const aAudible = { ...aMuted, muted: false };
+    engine.syncRouting(routeState([aAudible, b], { buses: soloBuses }));
+    assert.equal(ie.voices.get('a')!.trackGain.gain.value, 0.8);
+    assert.equal(ie.voices.get('b')!.trackGain.gain.value, 0);
+  });
+
+  it('播放中迁移总线只重接一次 panner，不 stop/start source，方位和节点身份不变', async () => {
+    await engine.resume();
+    const t = baseTrack();
+    engine.syncRouting(routeState([t]));
+    await engine.playTrack(t);
+    const ie = internals(engine);
+    const before = ie.voices.get('t1')!;
+    const sourceBefore = before.source;
+    const pannerBefore = before.panner;
+    const startsBefore = sourceBefore.started.length;
+    const stopsBefore = sourceBefore.stopped;
+
+    const moved = { ...t, busId: 'bus-b' };
+    engine.syncRouting(routeState([moved]));
+    const after = ie.voices.get('t1')!;
+    const busB = ie.busNodes.get('bus-b')!;
+    const busA = ie.busNodes.get('bus-a')!;
+    assert.equal(after.source, sourceBefore);
+    assert.equal(after.panner, pannerBefore);
+    assert.equal(after.busId, 'bus-b');
+    assert.equal(after.panner.connects.length, 1);
+    assert.ok(!after.panner.connects.some((c) => c.node === busA.gain));
+    assert.deepEqual(after.panner.connects.map((c) => c.node), [busB.gain]);
+    assert.equal(sourceBefore.started.length, startsBefore);
+    assert.equal(sourceBefore.stopped, stopsBefore);
+    assert.equal(after.panner.positionX.value, 2);
+  });
+
+  it('移动声源只写 AudioParam，绝不 stop/start source', async () => {
     await engine.resume();
     const t = baseTrack();
     await engine.playTrack(t);
-    const v = (engine as unknown as {
-      voices: Map<string, { source: FakeBufferSource; panner: FakePanner }>;
-    }).voices.get('t1')!;
+    const ie = internals(engine);
+    const v = ie.voices.get('t1')!;
     const startsBefore = v.source.started.length;
     const stopsBefore = v.source.stopped;
 
     for (let i = 0; i < 10; i++) {
-      engine.syncTracks([
-        { ...t, position: { x: 2 + i * 0.1, y: 0.5, z: -i * 0.2 } },
-      ]);
+      engine.syncTracks([{ ...t, position: { x: 2 + i * 0.1, y: 0.5, z: -i * 0.2 } }]);
     }
     assert.ok(Math.abs(v.panner.positionX.value - 2.9) < 1e-9);
     assert.ok(Math.abs(v.panner.positionY.value - 0.5) < 1e-9);
@@ -317,30 +352,25 @@ describe('AudioEngine 图行为（模拟环境）', () => {
     await engine.resume();
     const ctx = engine.ctx as unknown as FakeAudioContext;
     const t = { ...baseTrack(), loop: false };
+    engine.syncRouting(routeState([t]));
     await engine.playTrack(t);
     ctx.currentTime = 0.3;
     engine.pauseTrack(t);
     await engine.playTrack({ ...t });
-    const v = (engine as unknown as {
-      voices: Map<string, { source: FakeBufferSource; offset: number }>;
-    }).voices.get('t1')!;
-    // 最新一次 start 的 offset ≈ 0.3
+    const v = internals(engine).voices.get('t1')!;
     const last = v.source.started[v.source.started.length - 1];
     assert.ok(Math.abs(last.offset - 0.3) < 1e-6);
   });
 
-  it('总线与主增益真实写入对应 GainNode', async () => {
+  it('主增益和主静音真实写入 masterGain；主表串联在 destination 前', async () => {
     await engine.resume();
-    engine.setBusGain(0.42);
-    engine.setMasterGain(0.71);
-    const bus = (engine as unknown as { busGain: FakeGain }).busGain;
-    const master = (engine as unknown as { masterGain: FakeGain }).masterGain;
-    assert.ok(Math.abs(bus.gain.value - 0.42) < 1e-9);
-    assert.ok(Math.abs(master.gain.value - 0.71) < 1e-9);
-    // 主输出确实连向 destination（master → analyser → destination，worklet 不可用时）
-    const analyser = (engine as unknown as { analyser: FakeAnalyser }).analyser;
+    const ie = internals(engine);
+    engine.syncRouting(routeState([], { masterGain: 0.71 }));
+    assert.equal(ie.masterGain.gain.value, 0.71);
+    engine.syncRouting(routeState([], { masterGain: 0.71, masterMuted: true }));
+    assert.equal(ie.masterGain.gain.value, 0);
     const destination = (engine.ctx as unknown as FakeAudioContext).destination;
-    assert.ok(analyser.connects.some((c) => c.node === destination));
+    assert.ok(ie.masterAnalyser.connects.some((c) => c.node === destination));
   });
 
   it('坏文件解码失败抛出 DecodeError，且不影响其他声轨', async () => {
@@ -351,8 +381,7 @@ describe('AudioEngine 图行为（模拟环境）', () => {
 
     const good = baseTrack({ id: 'good' });
     await engine.ensureTrack(good);
-    const voices = (engine as unknown as { voices: Map<string, unknown> }).voices;
-    assert.ok(voices.has('good'));
+    assert.ok(internals(engine).voices.has('good'));
   });
 
   it('内置样例缓冲可经引擎合成，时长与声道符合预期', async () => {

@@ -127,6 +127,21 @@ export function TrackRow({ track, api }: Props) {
         </button>
       </div>
 
+      <div className="track-routing">
+        <span>总线</span>
+        <select
+          value={track.busId}
+          onChange={(e) => api.moveTrackToBus(track.id, e.target.value)}
+          title="迁移到其他本地监听总线（播放中不会重启声源）"
+        >
+          {api.doc.buses.map((bus) => (
+            <option key={bus.id} value={bus.id}>
+              {bus.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
       <div className="track-gain">
         <input
           type="range"

@@ -57,6 +57,16 @@ export function Inspector({ api }: { api: WorkbenchApi }) {
         <NumberField label="Z 后 (m)" value={track.position.z} onChange={(z) => setPos({ z })} />
       </div>
       <label className="num-field wide">
+        <span>归属总线</span>
+        <select value={track.busId} onChange={(e) => api.moveTrackToBus(track.id, e.target.value)}>
+          {api.doc.buses.map((bus) => (
+            <option key={bus.id} value={bus.id}>
+              {bus.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="num-field wide">
         <span>名称</span>
         <input
           type="text"

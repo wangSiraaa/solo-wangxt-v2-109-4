@@ -374,6 +374,92 @@ input[type='range'] {
   }
 }
 
+/* ---------- Bus panel ---------- */
+.bus-panel {
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.bus-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.bus-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.bus-row,
+.bus-controls,
+.track-routing {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.bus-name-input {
+  flex: 1;
+  min-width: 0;
+  background: #0d1118;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.bus-gain span:first-child {
+  color: var(--muted);
+}
+.bus-parent {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  flex: 1;
+}
+.bus-parent select,
+.track-routing select {
+  flex: 1;
+  min-width: 0;
+  background: #0d1118;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 3px 4px;
+  font-size: 11px;
+}
+.bus-members {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.bus-empty {
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 8px;
+  text-align: center;
+  font-size: 11px;
+}
+.track-routing {
+  font-size: 10px;
+  color: var(--muted);
+}
+.track-routing select {
+  font-size: 11px;
+}
+
 /* ---------- Track list ---------- */
 .track-list {
   flex: 1;

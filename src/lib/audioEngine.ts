@@ -1,30 +1,24 @@
 /**
  * AudioEngine —— Web Audio 核心，与 React 状态解耦。
  *
- * 信号链（每条声轨）：
- *   AudioBufferSourceNode ──► [ChannelSplitter 选取单声道]
- *      ──► trackGain ──► PannerNode(HRTF + 明确距离模型) ──► soloBus ──► busGain
- *                                          └（非独奏/静音）──► muteBus(增益0) ──┘
- *                                                                              ▼
- *                                                        masterGain ─► peakWorklet(逐采样峰值/削波)
- *                                                                              ├► AnalyserNode(回退表)
- *                                                                              └► AudioDestination
+ * 每条声轨的固定空间链：
+ *   AudioBufferSourceNode ─► ChannelSplitter(原始 L/R 选择)
+ *      ─► trackGain ─► PannerNode(HRTF)
+ *
+ * 可持久化监听总线（可嵌套但严禁成环）：
+ *   panner ─► busGain ─► busMeter ─► parentBusGain / masterGain
+ *   masterGain ─► masterMeter ─► analyser ─► destination
  *
  * 关键约定：
- *  - 移动声源只更新 PannerNode 的 position AudioParam（setTargetAtTime 平滑），
- *    绝不 stop/start 源节点，因此移动不会重启音轨。
- *  - 静音 = trackGain.gain=0；独奏通过 soloBus/muteBus 真实切换路由。
- *  - 峰值/削波在实际输出链末端（destination 之前）由 AudioWorklet 逐采样检测；
- *    Worklet 不可用时回退到 AnalyserNode 时域峰值（同样在输出链上）。
- *  - AudioContext 必须由用户手势解锁；解码失败逐条声轨以 DecodeError 上报。
+ *  - 迁移总线只断开并重接 PannerNode 的输出，绝不 stop/start BufferSource；
+ *    PannerNode 的位置参数和文件 L/R 选择均保持不变。
+ *  - 优先级（高到低）：masterMute / busMute（含祖先）→ bus solo 子树隔离
+ *    → track solo 隔离 → track mute → track gain → bus gain → master gain。
+ *  - 每个总线表与主表都串联在对应 GainNode 输出后的真实链路上，
+ *    AudioWorklet 不可用时退回到同样串联的 AnalyserNode。
  */
-import type {
-  LevelState,
-  ListenerState,
-  SpatialSettings,
-  Track,
-  UnlockState,
-} from '../types';
+import { MASTER_METER_ID, type Bus, type LevelState, type ListenerState, type MeterLevels, type SpatialSettings, type Track, type UnlockState } from '../types';
+import { createDefaultBuses } from './routing';
 import { forwardVector } from './spatial';
 import { createSampleBuffer } from './samples';
 
@@ -34,8 +28,7 @@ interface TrackVoice {
   source: AudioBufferSourceNode;
   trackGain: GainNode;
   panner: PannerNode;
-  /** true = 接在 soloBus（可听见）；false = 接在增益为 0 的 muteBus */
-  audiblyRouted: boolean;
+  busId: string;
   playing: boolean;
   consumed: boolean; // source 是否已 start 过（结束后必须重建才能再播）
   startedAt: number;
@@ -43,8 +36,22 @@ interface TrackVoice {
   duration: number;
 }
 
+interface BusNodes {
+  spec: Bus;
+  gain: GainNode;
+  analyser: AnalyserNode;
+  worklet: AudioWorkletNode | null;
+}
+
+interface RoutingState {
+  buses: Bus[];
+  tracks: Track[];
+  masterGain: number;
+  masterMuted: boolean;
+}
+
 export type EngineUnlockListener = (state: UnlockState) => void;
-export type EngineLevelListener = (level: LevelState) => void;
+export type EngineLevelListener = (levels: MeterLevels) => void;
 export type EngineEndedListener = (trackId: string) => void;
 
 export class DecodeError extends Error {
@@ -56,33 +63,44 @@ export class DecodeError extends Error {
   }
 }
 
+function emptyLevels(): LevelState {
+  return { l: 0, r: 0, clipL: false, clipR: false };
+}
+
 export class AudioEngine {
   ctx: AudioContext | null = null;
   unlock: UnlockState = 'locked';
 
-  private busGain: GainNode | null = null;
   private masterGain: GainNode | null = null;
-  private soloBus: GainNode | null = null;
-  private muteBus: GainNode | null = null;
-  private analyser: AnalyserNode | null = null;
+  private masterAnalyser: AnalyserNode | null = null;
+  private masterWorklet: AudioWorkletNode | null = null;
   private timeDomainBuf: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(8192));
-  private peakWorklet: AudioWorkletNode | null = null;
+  private peakWorkletReady = false;
   private workletFailed = false;
+  private workletGeneration = 0;
+  private insertingWorklets: Promise<void> | null = null;
+  private disposed = false;
 
+  private busNodes = new Map<string, BusNodes>();
   private voices = new Map<string, TrackVoice>();
   private buffers = new Map<string, AudioBuffer>();
   private pendingFiles = new Map<string, Blob>();
 
   private spatial: SpatialSettings | null = null;
-  private anySolo = false;
+  private routing: RoutingState = {
+    buses: createDefaultBuses(),
+    tracks: [],
+    masterGain: 0.9,
+    masterMuted: false,
+  };
+  private meterLevels: MeterLevels = { [MASTER_METER_ID]: emptyLevels() };
+  /** 由 UI 注入的最新已校验文档读取器，保证解锁后立即 ensureTrack 时也能拿到刚提交的总线。 */
+  private getLatestRouting: (() => RoutingState | null) | null = null;
 
   private unlockListeners = new Set<EngineUnlockListener>();
   private levelListeners = new Set<EngineLevelListener>();
   private endedListeners = new Set<EngineEndedListener>();
   private rafHandle = 0;
-  private clipLatchL = false;
-  private clipLatchR = false;
-  private lastPeak: LevelState = { l: 0, r: 0, clipL: false, clipR: false };
 
   onUnlock(fn: EngineUnlockListener): () => void {
     this.unlockListeners.add(fn);
@@ -116,6 +134,8 @@ export class AudioEngine {
     }
     this.unlock = 'unlocking';
     this.emitUnlock();
+    const previousCtx = this.ctx;
+    this.ctx = null;
     try {
       const Ctor: typeof AudioContext =
         window.AudioContext ??
@@ -123,16 +143,24 @@ export class AudioEngine {
       if (!Ctor) throw new Error('当前浏览器不支持 Web Audio API');
       const ctx = new Ctor();
       this.ctx = ctx;
+      const latest = this.getLatestRouting?.();
+      if (latest) this.routing = latest;
+      this.disposed = false;
+      this.workletFailed = false;
       this.buildGraph(ctx);
       if (ctx.state === 'suspended') await ctx.resume();
       if (ctx.state !== 'running') {
         throw new Error('AudioContext 被浏览器策略阻止，未能进入 running 状态');
       }
+      if (previousCtx) void previousCtx.close();
       this.unlock = 'unlocked';
       this.emitUnlock();
       this.startMeterLoop();
-      void this.ensurePeakWorklet(ctx);
+      void this.ensurePeakWorklets(ctx);
     } catch (err) {
+      if (this.ctx) void this.ctx.close();
+      else if (previousCtx) void previousCtx.close();
+      this.ctx = null;
       this.unlock = 'failed';
       this.emitUnlock();
       throw err;
@@ -140,63 +168,134 @@ export class AudioEngine {
   }
 
   private buildGraph(ctx: AudioContext) {
-    this.soloBus = ctx.createGain();
-    this.muteBus = ctx.createGain();
-    this.muteBus.gain.value = 0;
-    this.busGain = ctx.createGain();
     this.masterGain = ctx.createGain();
-    this.analyser = ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.timeDomainBuf = new Float32Array(new ArrayBuffer(this.analyser.fftSize * 4));
+    this.masterAnalyser = ctx.createAnalyser();
+    this.masterAnalyser.fftSize = 2048;
+    this.timeDomainBuf = new Float32Array(new ArrayBuffer(this.masterAnalyser.fftSize * 4));
+    this.masterWorklet = null;
+    this.peakWorkletReady = false;
+    this.workletGeneration += 1;
+    this.insertingWorklets = null;
+    this.busNodes.clear();
+    this.voices.clear();
+    this.buffers.clear();
+    this.pendingFiles.clear();
+    this.meterLevels = { [MASTER_METER_ID]: emptyLevels() };
 
-    this.soloBus.connect(this.busGain);
-    this.muteBus.connect(this.busGain);
-    this.busGain.connect(this.masterGain);
-    // 先经过 analyser（回退表）；worklet 加载成功后串入 master 与 destination 之间
-    this.masterGain.connect(this.analyser);
-    this.analyser.connect(ctx.destination);
+    for (const bus of this.routing.buses) this.createBusNode(ctx, bus);
+    this.reconnectBuses();
+    this.applyMasterGain();
+
+    // worklet 加载前使用同样串联在真实链上的 analyser 作为回退表。
+    this.masterGain.connect(this.masterAnalyser);
+    this.masterAnalyser.connect(ctx.destination);
+  }
+
+  private createBusNode(ctx: AudioContext, bus: Bus): BusNodes {
+    const gain = ctx.createGain();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    const nodes: BusNodes = { spec: { ...bus }, gain, analyser, worklet: null };
+    this.busNodes.set(bus.id, nodes);
+    this.meterLevels[bus.id] = emptyLevels();
+    gain.connect(analyser);
+    return nodes;
+  }
+
+  private reconnectBuses() {
+    if (!this.ctx) return;
+    for (const nodes of this.busNodes.values()) {
+      nodes.analyser.disconnect();
+      const parentId = nodes.spec.parentId;
+      const parent = parentId ? this.busNodes.get(parentId) : null;
+      if (parentId && !parent) continue;
+      nodes.analyser.connect(parent ? parent.gain : this.masterGain!);
+    }
+  }
+
+  private reconcileBuses(ctx: AudioContext, buses: Bus[]) {
+    const previousParents = new Map([...this.busNodes].map(([id, nodes]) => [id, nodes.spec.parentId]));
+    const next = new Map<string, Bus>();
+    for (const bus of buses) next.set(bus.id, bus);
+
+    for (const id of [...this.busNodes.keys()]) {
+      if (!next.has(id)) {
+        const old = this.busNodes.get(id)!;
+        this.disconnectBusNode(old);
+        this.busNodes.delete(id);
+        delete this.meterLevels[id];
+      }
+    }
+
+    let parentsChanged = false;
+    for (const bus of buses) {
+      let nodes = this.busNodes.get(bus.id);
+      if (!nodes) {
+        nodes = this.createBusNode(ctx, bus);
+        parentsChanged = true;
+      }
+      if (previousParents.get(bus.id) !== bus.parentId) parentsChanged = true;
+      nodes.spec = { ...bus };
+      nodes.gain.gain.setTargetAtTime(bus.muted ? 0 : bus.gain, ctx.currentTime, 0.01);
+    }
+    if (parentsChanged || this.busNodes.size !== buses.length) this.reconnectBuses();
+
+    // worklet 已可用时，为后增总线补装真实逐采样表。
+    if (this.peakWorkletReady) void this.insertAvailableWorklets(ctx);
+  }
+
+  private disconnectBusNode(nodes: BusNodes) {
+    try {
+      nodes.gain.disconnect();
+      nodes.analyser.disconnect();
+      nodes.worklet?.disconnect();
+    } catch {
+      /* node may already be disconnected */
+    }
   }
 
   /**
-   * 峰值/削波检测器串联在 masterGain 之后、destination 之前的真实输出链上，
-   * 逐采样扫描。Worklet 源码以 Blob 注入，无需额外网络资源。
+   * 逐采样峰值/削波检测器串联在每个 bus/master GainNode 之后。
+   * Worklet 源码以 Blob 注入，无需额外网络资源。
    */
-  private async ensurePeakWorklet(ctx: AudioContext): Promise<boolean> {
-    if (this.peakWorklet || this.workletFailed) return !!this.peakWorklet;
+  private async ensurePeakWorklets(ctx: AudioContext): Promise<boolean> {
+    if (this.peakWorkletReady || this.workletFailed) return this.peakWorkletReady;
+    const generation = this.workletGeneration;
     try {
       const workletSource = `
-class PeakMeterProcessor extends AudioWorkletProcessor {
+class MeterProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() { return []; }
   process(inputs, outputs) {
-    const in0 = inputs[0];
-    const out0 = outputs[0];
-    if (!in0 || in0.length === 0) {
-      // 上游静默优化时输出保持零填充即可
-      return true;
-    }
-    let peakL = 0, peakR = 0, clipL = false, clipR = false;
+    const in0 = inputs[0] || [];
+    const out0 = outputs[0] || [];
     const l = in0[0];
     const r = in0[1] || in0[0];
     const ol = out0[0];
     const or = out0[1] || out0[0];
-    for (let i = 0; i < l.length; i++) {
-      const vl = l[i];
-      const al = Math.abs(vl);
-      if (al > peakL) peakL = al;
-      if (al >= 1.0) clipL = true;
-      if (ol) ol[i] = vl; // 必须显式透传，否则输出静音
+    let peakL = 0, peakR = 0, clipL = false, clipR = false;
+    if (l && ol) {
+      for (let i = 0; i < l.length; i++) {
+        const vl = l[i];
+        const al = Math.abs(vl);
+        if (al > peakL) peakL = al;
+        if (al >= 1.0) clipL = true;
+        ol[i] = vl;
+      }
     }
-    if (r && or) for (let i = 0; i < r.length; i++) {
-      const vr = r[i];
-      const ar = Math.abs(vr);
-      if (ar > peakR) peakR = ar;
-      if (ar >= 1.0) clipR = true;
-      if (out0[1]) or[i] = vr;
+    if (r && or) {
+      for (let i = 0; i < r.length; i++) {
+        const vr = r[i];
+        const ar = Math.abs(vr);
+        if (ar > peakR) peakR = ar;
+        if (ar >= 1.0) clipR = true;
+        or[i] = vr;
+      }
     }
     this.port.postMessage({ l: peakL, r: peakR, clipL, clipR });
     return true;
   }
 }
-registerProcessor('peak-meter', PeakMeterProcessor);
+registerProcessor('routing-meter', MeterProcessor);
 `;
       const blob = new Blob([workletSource], { type: 'application/javascript' });
       const url = URL.createObjectURL(blob);
@@ -205,69 +304,133 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       } finally {
         URL.revokeObjectURL(url);
       }
+      if (this.disposed || this.ctx !== ctx || generation !== this.workletGeneration) return false;
+      this.peakWorkletReady = true;
+      await this.insertAvailableWorklets(ctx, generation);
+      return true;
+    } catch {
+      if (generation === this.workletGeneration) this.workletFailed = true;
+      return false;
+    }
+  }
 
-      const node = new AudioWorkletNode(ctx, 'peak-meter', {
-        // 节点串在真实输出链上：必须保持立体声直通，避免被下混成单声道
+  private insertAvailableWorklets(ctx: AudioContext, generation = this.workletGeneration): Promise<void> {
+    if (
+      !this.peakWorkletReady ||
+      this.ctx !== ctx ||
+      generation !== this.workletGeneration ||
+      this.insertingWorklets
+    ) {
+      return this.insertingWorklets ?? Promise.resolve();
+    }
+    const job = this.insertWorkletNodes(ctx, generation);
+    this.insertingWorklets = job;
+    void job.finally(() => {
+      if (this.insertingWorklets === job) this.insertingWorklets = null;
+    });
+    return job;
+  }
+
+  private async insertWorkletNodes(ctx: AudioContext, generation: number): Promise<void> {
+    const insert = async (
+      id: string,
+      source: GainNode,
+      analyser: AnalyserNode,
+      existing: AudioWorkletNode | null,
+    ): Promise<AudioWorkletNode | null> => {
+      if (
+        existing ||
+        !this.peakWorkletReady ||
+        this.ctx !== ctx ||
+        generation !== this.workletGeneration
+      ) {
+        return existing;
+      }
+      const node = new AudioWorkletNode(ctx, 'routing-meter', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [2],
       });
       node.channelCount = 2;
       node.channelInterpretation = 'speakers';
-      // 重排实际链路：masterGain -> peakWorklet -> analyser -> destination
-      this.masterGain!.disconnect();
-      this.masterGain!.connect(node);
-      this.analyser!.disconnect();
-      node.connect(this.analyser!);
-      this.analyser!.connect(ctx.destination);
-      node.port.onmessage = (e: MessageEvent<LevelState>) => {
-        const d = e.data;
-        if (d.clipL) this.clipLatchL = true;
-        if (d.clipR) this.clipLatchR = true;
-        this.lastPeak = { l: d.l, r: d.r, clipL: this.clipLatchL, clipR: this.clipLatchR };
+      source.disconnect();
+      source.connect(node);
+      node.connect(analyser);
+      node.port.onmessage = (e: MessageEvent<Omit<LevelState, never>>) => {
+        this.recordWorkletLevel(id, e.data);
       };
-      this.peakWorklet = node;
-      return true;
-    } catch {
-      this.workletFailed = true;
-      return false;
+      return node;
+    };
+
+    if (this.masterGain && this.masterAnalyser) {
+      this.masterWorklet = await insert(
+        MASTER_METER_ID,
+        this.masterGain,
+        this.masterAnalyser,
+        this.masterWorklet,
+      );
+    }
+    for (const nodes of this.busNodes.values()) {
+      nodes.worklet = await insert(nodes.spec.id, nodes.gain, nodes.analyser, nodes.worklet);
     }
   }
 
-  clearClipLatch() {
-    this.clipLatchL = false;
-    this.clipLatchR = false;
+  private recordWorkletLevel(id: string, d: LevelState) {
+    const prev = this.meterLevels[id] ?? emptyLevels();
+    this.meterLevels[id] = {
+      l: d.l,
+      r: d.r,
+      clipL: prev.clipL || d.clipL,
+      clipR: prev.clipR || d.clipR,
+    };
+  }
+
+  clearClipLatch(id?: string) {
+    if (id) {
+      const level = this.meterLevels[id];
+      if (level) this.meterLevels[id] = { ...level, clipL: false, clipR: false };
+      return;
+    }
+    for (const key of Object.keys(this.meterLevels)) {
+      this.meterLevels[key] = { ...this.meterLevels[key], clipL: false, clipR: false };
+    }
   }
 
   private startMeterLoop() {
     const tick = () => {
-      if (!this.peakWorklet && this.analyser) {
-        // 回退：AnalyserNode 时域块峰值，仍挂在真实输出链上
-        this.analyser.getFloatTimeDomainData(this.timeDomainBuf);
-        let peak = 0;
-        for (let i = 0; i < this.timeDomainBuf.length; i++) {
-          const a = Math.abs(this.timeDomainBuf[i]);
-          if (a > peak) peak = a;
-        }
-        if (peak >= 1) {
-          this.clipLatchL = true;
-          this.clipLatchR = true;
-        }
-        this.lastPeak = {
-          l: peak,
-          r: peak,
-          clipL: this.clipLatchL,
-          clipR: this.clipLatchR,
-        };
+      if (!this.peakWorkletReady) {
+        this.pollAnalyser(MASTER_METER_ID, this.masterAnalyser ?? null);
+        for (const [id, nodes] of this.busNodes) this.pollAnalyser(id, nodes.analyser);
       }
-      const p = this.lastPeak;
-      this.levelListeners.forEach((fn) => fn({ ...p }));
+      // 复制给 UI，避免调用方持有引擎内部表。
+      const snapshot = Object.fromEntries(
+        Object.entries(this.meterLevels).map(([id, v]) => [id, { ...v }]),
+      );
+      this.levelListeners.forEach((fn) => fn(snapshot));
       this.rafHandle = requestAnimationFrame(tick);
     };
     this.rafHandle = requestAnimationFrame(tick);
   }
 
-  // ---------- 全局参数 ----------
+  private pollAnalyser(id: string, analyser: AnalyserNode | null) {
+    if (!analyser) return;
+    analyser.getFloatTimeDomainData(this.timeDomainBuf);
+    let peak = 0;
+    for (let i = 0; i < this.timeDomainBuf.length; i++) {
+      const a = Math.abs(this.timeDomainBuf[i]);
+      if (a > peak) peak = a;
+    }
+    const prev = this.meterLevels[id] ?? emptyLevels();
+    const clip = peak >= 1;
+    this.meterLevels[id] = {
+      l: peak,
+      r: peak,
+      clipL: prev.clipL || clip,
+      clipR: prev.clipR || clip,
+    };
+  }
+
+  // ---------- 全局参数与路由 ----------
 
   setSpatialSettings(s: SpatialSettings) {
     this.spatial = s;
@@ -280,16 +443,31 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     }
   }
 
-  setBusGain(g: number) {
-    if (this.busGain && this.ctx) {
-      this.busGain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.01);
+  setRoutingProvider(fn: (() => RoutingState | null) | null) {
+    this.getLatestRouting = fn;
+  }
+
+  /** 完整替换路由/成员/总线状态。调用方必须已经通过 routing 校验。 */
+  syncRouting(state: RoutingState) {
+    this.routing = {
+      buses: state.buses.map((b) => ({ ...b })),
+      tracks: state.tracks.map((t) => ({ ...t })),
+      masterGain: state.masterGain,
+      masterMuted: state.masterMuted,
+    };
+    if (!this.ctx) return;
+    this.reconcileBuses(this.ctx, state.buses);
+    this.applyMasterGain();
+    for (const track of state.tracks) {
+      const voice = this.voices.get(track.id);
+      if (voice) this.updateVoiceLive(voice, track, state.buses, state.tracks);
     }
   }
 
-  setMasterGain(g: number) {
-    if (this.masterGain && this.ctx) {
-      this.masterGain.gain.setTargetAtTime(g, this.ctx.currentTime, 0.01);
-    }
+  private applyMasterGain() {
+    if (!this.ctx || !this.masterGain) return;
+    const value = this.routing.masterMuted ? 0 : this.routing.masterGain;
+    this.masterGain.gain.setTargetAtTime(value, this.ctx.currentTime, 0.01);
   }
 
   /** 听者位置/朝向；朝向定义与 spatial.ts、Three.js 相机严格一致 */
@@ -313,11 +491,46 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     set(li.upZ, u.z);
   }
 
+  private effectiveTrackGain(track: Track, buses: Bus[], allTracks: Track[]): number {
+    if (track.muted || this.routing.masterMuted) return 0;
+    const byId = new Map(buses.map((b) => [b.id, b]));
+    let cur: string | null = track.busId;
+    const chain: Bus[] = [];
+    const guard = new Set<string>();
+    while (cur) {
+      if (guard.has(cur)) return 0; // 引擎只接受已校验图，这里防御性处理。
+      guard.add(cur);
+      const bus = byId.get(cur);
+      if (!bus) return 0;
+      chain.push(bus);
+      cur = bus.parentId;
+    }
+
+    const soloBusIds = buses.filter((b) => b.solo).map((b) => b.id);
+    if (soloBusIds.length > 0) {
+      const active = new Set<string>();
+      for (const soloId of soloBusIds) {
+        let id: string | null = soloId;
+        const seen = new Set<string>();
+        while (id && !seen.has(id)) {
+          seen.add(id);
+          active.add(id);
+          id = byId.get(id)?.parentId ?? null;
+        }
+      }
+      if (!chain.some((b) => active.has(b.id))) return 0;
+    } else if (allTracks.some((t) => t.solo) && !track.solo) {
+      return 0;
+    }
+    if (chain.some((b) => b.muted)) return 0;
+    return track.gain;
+  }
+
   // ---------- 声轨缓冲与节点 ----------
 
   /**
    * 确保声轨缓冲与节点就绪。
-   * 已存在的 voice 只做实时参数更新（位置/增益/路由/loop），绝不重启源。
+   * 已存在的 voice 只做实时参数更新（位置/增益/总线/loop），绝不重启源。
    */
   async ensureTrack(track: Track): Promise<void> {
     if (!this.ctx || this.unlock !== 'unlocked') return;
@@ -347,7 +560,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     if (!existing) {
       this.voices.set(track.id, this.createVoice(track, buffer));
     } else {
-      this.updateVoiceLive(existing, track);
+      this.updateVoiceLive(existing, track, this.routing.buses, this.routing.tracks);
     }
   }
 
@@ -367,7 +580,11 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     source.loop = track.loop;
 
     const trackGain = ctx.createGain();
-    trackGain.gain.value = track.muted ? 0 : track.gain;
+    trackGain.gain.value = this.effectiveTrackGain(
+      track,
+      this.routing.buses,
+      this.routing.tracks.some((t) => t.id === track.id) ? this.routing.tracks : [...this.routing.tracks, track],
+    );
 
     const panner = new PannerNode(ctx, {
       panningModel: 'HRTF',
@@ -387,13 +604,13 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       const splitter = ctx.createChannelSplitter(buffer.numberOfChannels);
       source.connect(splitter);
       const ch = Math.min(track.channel, buffer.numberOfChannels - 1);
-      // splitter 单口输出为单声道，接入立体声 gain 时浏览器自动等声级上混
       splitter.connect(trackGain, ch);
     }
     trackGain.connect(panner);
 
-    const audible = this.shouldBeAudible(track);
-    panner.connect(audible ? this.soloBus! : this.muteBus!);
+    const bus = this.busNodes.get(track.busId);
+    if (!bus) throw new Error(`声轨「${track.name}」指向无效总线，无法建立音频节点`);
+    panner.connect(bus.gain);
 
     const voice: TrackVoice = {
       trackId: track.id,
@@ -401,7 +618,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       source,
       trackGain,
       panner,
-      audiblyRouted: audible,
+      busId: track.busId,
       playing: false,
       consumed: false,
       startedAt: 0,
@@ -424,64 +641,42 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     return voice;
   }
 
-  private shouldBeAudible(track: Track): boolean {
-    if (track.muted) return false;
-    if (this.anySolo) return track.solo;
-    return true;
-  }
-
-  /** 实时参数更新：不触碰 source 节点 —— 移动声源不会重启音轨 */
-  private updateVoiceLive(voice: TrackVoice, track: Track) {
+  /** 实时参数更新：不触碰 source —— 换总线/移动声源都不会重启音轨 */
+  private updateVoiceLive(voice: TrackVoice, track: Track, buses: Bus[], allTracks: Track[]) {
     const ctx = this.ctx!;
     const t = ctx.currentTime;
     const tau = Math.max(0.005, this.spatial?.positionTimeConstant ?? 0.05);
+
+    // 迁移总线：只重接 panner 输出；source/trackGain/panner 节点身份和位置均不变。
+    if (voice.busId !== track.busId) {
+      const target = this.busNodes.get(track.busId);
+      if (!target) throw new Error(`目标总线不存在：${track.busId}`);
+      // disconnect 会先移除 PannerNode 的全部（规范上仅一条）总线输出，再接唯一新总线。
+      voice.panner.disconnect();
+      voice.panner.connect(target.gain);
+      voice.busId = track.busId;
+    }
 
     voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
     voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
     voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
     voice.panner.distanceModel = this.spatial?.distanceModel ?? voice.panner.distanceModel;
 
-    voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
+    voice.trackGain.gain.setTargetAtTime(this.effectiveTrackGain(track, buses, allTracks), t, 0.01);
     if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
-
-    const audible = this.shouldBeAudible(track);
-    if (audible !== voice.audiblyRouted) {
-      voice.panner.disconnect();
-      voice.panner.connect(audible ? this.soloBus! : this.muteBus!);
-      voice.audiblyRouted = audible;
-    }
     voice.spec = track;
   }
 
-  /** 静音/独奏变化：重新评估全部路由（增益本身在 updateVoiceLive 中已设置） */
-  reevaluateRouting(tracks: Track[]) {
-    this.anySolo = tracks.some((t) => t.solo);
-    if (!this.ctx) return;
-    for (const tr of tracks) {
-      const v = this.voices.get(tr.id);
-      if (!v) continue;
-      const audible = this.shouldBeAudible(tr);
-      if (audible !== v.audiblyRouted) {
-        v.panner.disconnect();
-        v.panner.connect(audible ? this.soloBus! : this.muteBus!);
-        v.audiblyRouted = audible;
-      }
-      v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
-      v.spec = tr;
-    }
-  }
-
   /**
-   * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏路由。
-   * 不创建节点、不触碰 source，移动声源不会重启音轨。
-   * 尚未创建 voice 的声轨（未解锁/未解码）跳过，由 ensureTrack 负责。
+   * 高频实时同步：只更新 AudioParam 与 panner 的一条输出连接。
+   * 不创建 BufferSource、不 stop/start，移动或换总线均不重启。
    */
   syncTracks(tracks: Track[]) {
     if (!this.ctx) return;
-    this.anySolo = tracks.some((t) => t.solo);
+    this.routing.tracks = tracks.map((t) => ({ ...t }));
     for (const tr of tracks) {
       const v = this.voices.get(tr.id);
-      if (v) this.updateVoiceLive(v, tr);
+      if (v) this.updateVoiceLive(v, tr, this.routing.buses, tracks);
     }
   }
 
@@ -491,7 +686,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
 
   /**
    * 重建声轨输入图（切换立体声文件的 L/R 声道时使用）。
-   * 保持播放偏移；若原本在播放，从同一位置继续（声道选择本身不属于“移动”）。
+   * 保持播放偏移；若原本在播放，从同一位置继续。总线迁移严禁走此路径。
    */
   async rebuildVoiceGraph(track: Track): Promise<void> {
     await this.ensureTrack(track);
@@ -517,7 +712,6 @@ registerProcessor('peak-meter', PeakMeterProcessor);
     if (!voice) return;
     if (voice.playing) return;
     if (voice.consumed) {
-      // 自然结束后未被 onended 重建的兜底
       const buf = this.buffers.get(track.id)!;
       voice = this.replaceVoice(voice, track, buf, voice.offset);
     }
@@ -564,8 +758,8 @@ registerProcessor('peak-meter', PeakMeterProcessor);
   }
 
   /**
-   * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转）。
-   * 位置移动严禁走此路径。
+   * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转/L-R 输入选择）。
+   * 位置移动和总线迁移严禁走此路径。
    */
   private replaceVoice(
     old: TrackVoice,
@@ -627,10 +821,19 @@ registerProcessor('peak-meter', PeakMeterProcessor);
   }
 
   dispose() {
+    this.disposed = true;
+    this.workletGeneration += 1;
     cancelAnimationFrame(this.rafHandle);
     for (const id of [...this.voices.keys()]) this.removeTrack(id);
+    for (const nodes of this.busNodes.values()) this.disconnectBusNode(nodes);
+    this.busNodes.clear();
     void this.ctx?.close();
     this.ctx = null;
+    this.masterGain = null;
+    this.masterAnalyser = null;
+    this.masterWorklet = null;
+    this.peakWorkletReady = false;
+    this.workletFailed = false;
     this.unlock = 'locked';
   }
 }
@@ -642,7 +845,6 @@ registerProcessor('peak-meter', PeakMeterProcessor);
 function localUp(yaw: number, pitch: number): { x: number; y: number; z: number } {
   const cp = Math.cos(pitch);
   const sp = Math.sin(pitch);
-  // 抬头时头顶略向 +Z（听者身后）倾；再绕世界 Y 按“右转”约定施加 yaw
   return {
     x: -sp * Math.sin(yaw),
     y: cp,

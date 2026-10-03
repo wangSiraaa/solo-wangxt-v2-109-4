@@ -17,6 +17,8 @@ export interface Track {
   /** file 类型时为 IDB 中的 Blob 键；内置样例重新生成，不需要持久化音频 */
   blobKey?: string;
   originalFileName?: string;
+  /** 成员路由：每条声轨恰好归属一个有效总线；null 只允许在尚未初始化的极短瞬间出现 */
+  busId: string;
   loop: boolean;
   muted: boolean;
   solo: boolean;
@@ -62,13 +64,30 @@ export interface SpatialSettings {
   hrtfIR: 'none';
 }
 
+/** 本地监听总线。parentId=null 时直接进入主输出，否则进入父总线。 */
+export interface Bus {
+  id: string;
+  name: string;
+  parentId: string | null;
+  gain: number;
+  muted: boolean;
+  solo: boolean;
+  color: string;
+}
+
+export const CURRENT_PROJECT_VERSION = 2;
+export const MASTER_METER_ID = 'master';
+
 export interface ProjectDoc {
-  version: 1;
+  version: 2;
+  /** 路由图版本：每次结构/成员/总线状态事务成功后递增；失败不递增 */
+  routeVersion: number;
+  buses: Bus[];
   tracks: Track[];
   listener: ListenerState;
   spatial: SpatialSettings;
-  busGain: number;
   masterGain: number;
+  masterMuted: boolean;
   savedAt: number;
   name?: string;
 }
@@ -88,6 +107,9 @@ export interface LevelState {
   clipL: boolean;
   clipR: boolean;
 }
+
+/** key 为总线 id 或 MASTER_METER_ID；仪表只保存真实链路的瞬时读数，不持久化峰值 */
+export type MeterLevels = Record<string, LevelState>;
 
 export type UnlockState = 'locked' | 'unlocking' | 'unlocked' | 'failed';
 

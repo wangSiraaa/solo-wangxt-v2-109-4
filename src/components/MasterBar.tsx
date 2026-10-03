@@ -2,6 +2,7 @@ import { useRef } from 'react';
 import type { WorkbenchApi } from '../state/useWorkbench';
 import { Meter } from './Meter';
 import { gainToDb } from '../lib/spatial';
+import { MASTER_METER_ID } from '../types';
 import type { SourceType } from '../types';
 
 interface Props {
@@ -53,20 +54,15 @@ export function MasterBar({ api }: Props) {
       </div>
 
       <div className="master-gains">
-        <label className="gain-fader">
-          <span>总线</span>
-          <input
-            type="range"
-            min={0}
-            max={1.5}
-            step={0.01}
-            value={api.doc.busGain}
-            onChange={(e) => api.setBusGain(Number(e.target.value))}
-          />
-          <b>{gainToDb(api.doc.busGain)}</b>
-        </label>
         <label className="gain-fader master">
           <span>主输出</span>
+          <button
+            type="button"
+            className={`btn mini ${api.doc.masterMuted ? 'active' : ''}`}
+            onClick={() => api.setMasterMuted(!api.doc.masterMuted)}
+          >
+            M
+          </button>
           <input
             type="range"
             min={0}
@@ -75,11 +71,14 @@ export function MasterBar({ api }: Props) {
             value={api.doc.masterGain}
             onChange={(e) => api.setMasterGain(Number(e.target.value))}
           />
-          <b>{gainToDb(api.doc.masterGain)}</b>
+          <b>{gainToDb(api.doc.masterMuted ? 0 : api.doc.masterGain)}</b>
         </label>
       </div>
 
-      <Meter levels={api.levels} onClear={api.clearClips} />
+      <Meter
+        levels={api.levels[MASTER_METER_ID] ?? { l: 0, r: 0, clipL: false, clipR: false }}
+        onClear={() => api.clearClips(MASTER_METER_ID)}
+      />
     </div>
   );
 }

@@ -8,6 +8,187 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/types.ts
+var CURRENT_PROJECT_VERSION, MASTER_METER_ID;
+var init_types = __esm({
+  "src/types.ts"() {
+    "use strict";
+    CURRENT_PROJECT_VERSION = 2;
+    MASTER_METER_ID = "master";
+  }
+});
+
+// src/lib/routing.ts
+var routing_exports = {};
+__export(routing_exports, {
+  DEFAULT_BUS_IDS: () => DEFAULT_BUS_IDS,
+  RoutingError: () => RoutingError,
+  ancestorBusIds: () => ancestorBusIds,
+  assertCanDeleteBus: () => assertCanDeleteBus,
+  commitRouting: () => commitRouting,
+  createBus: () => createBus,
+  createDefaultBuses: () => createDefaultBuses,
+  defaultBusIdForTrack: () => defaultBusIdForTrack,
+  descendantBusIds: () => descendantBusIds,
+  isTrackAudibleInDoc: () => isTrackAudibleInDoc,
+  normalizeProjectDoc: () => normalizeProjectDoc,
+  routeSnapshot: () => routeSnapshot,
+  validateRouting: () => validateRouting
+});
+function createDefaultBuses() {
+  return [
+    { id: DEFAULT_BUS_IDS[0], name: "\u603B\u7EBF A", parentId: null, gain: 1, muted: false, solo: false, color: BUS_COLORS[0] },
+    { id: DEFAULT_BUS_IDS[1], name: "\u603B\u7EBF B", parentId: null, gain: 1, muted: false, solo: false, color: BUS_COLORS[1] }
+  ];
+}
+function createBus(id, index, parentId = null) {
+  return {
+    id,
+    name: `\u603B\u7EBF ${String.fromCharCode(65 + index)}`,
+    parentId,
+    gain: 1,
+    muted: false,
+    solo: false,
+    color: BUS_COLORS[index % BUS_COLORS.length]
+  };
+}
+function defaultBusIdForTrack(buses2, trackIndex) {
+  return buses2[trackIndex % Math.max(buses2.length, 1)]?.id ?? DEFAULT_BUS_IDS[0];
+}
+function normalizeProjectDoc(raw) {
+  const buses2 = raw.buses?.length ? raw.buses.map((b) => ({ ...b })) : createDefaultBuses();
+  const validIds = new Set(buses2.map((b) => b.id));
+  const tracks = raw.tracks.map((t, i) => {
+    const { busId: stored, ...rest } = t;
+    const busId = stored && validIds.has(stored) ? stored : buses2[i % buses2.length].id;
+    return { ...rest, busId };
+  });
+  const doc = {
+    version: CURRENT_PROJECT_VERSION,
+    routeVersion: typeof raw.routeVersion === "number" && raw.routeVersion >= 0 ? raw.routeVersion : 1,
+    buses: buses2,
+    tracks,
+    listener: raw.listener,
+    spatial: raw.spatial,
+    masterGain: typeof raw.masterGain === "number" ? raw.masterGain : 0.9,
+    masterMuted: raw.masterMuted ?? false,
+    savedAt: raw.savedAt ?? 0,
+    name: raw.name
+  };
+  validateRouting(doc.buses, doc.tracks);
+  return doc;
+}
+function validateRouting(buses2, tracks) {
+  if (buses2.length === 0) {
+    throw new RoutingError("empty-bus", "\u81F3\u5C11\u5FC5\u987B\u4FDD\u7559\u4E00\u4E2A\u6709\u6548\u603B\u7EBF");
+  }
+  const byId = /* @__PURE__ */ new Map();
+  for (const bus of buses2) {
+    if (byId.has(bus.id)) throw new RoutingError("dangling", `\u603B\u7EBF id \u91CD\u590D\uFF1A${bus.id}`);
+    byId.set(bus.id, bus);
+  }
+  for (const bus of buses2) {
+    if (bus.parentId !== null && !byId.has(bus.parentId)) {
+      throw new RoutingError("dangling", `\u603B\u7EBF\u300C${bus.name}\u300D\u6307\u5411\u5DF2\u4E0D\u5B58\u5728\u7684\u7236\u603B\u7EBF`);
+    }
+  }
+  for (const start of buses2) {
+    const seen = /* @__PURE__ */ new Set();
+    let cur = start.id;
+    while (cur) {
+      if (seen.has(cur)) {
+        throw new RoutingError("cycle", `\u68C0\u6D4B\u5230\u5FAA\u73AF\u8DEF\u7531\uFF1A${[...seen, cur].join(" \u2192 ")}`);
+      }
+      seen.add(cur);
+      cur = byId.get(cur)?.parentId ?? null;
+    }
+  }
+  for (const track of tracks) {
+    if (!byId.has(track.busId)) {
+      throw new RoutingError("dangling", `\u58F0\u8F68\u300C${track.name}\u300D\u6CA1\u6709\u5F52\u5C5E\u5230\u6709\u6548\u603B\u7EBF`);
+    }
+  }
+}
+function commitRouting(doc, recipe) {
+  const draft = structuredClone(doc);
+  recipe(draft);
+  validateRouting(draft.buses, draft.tracks);
+  draft.routeVersion = doc.routeVersion + 1;
+  return draft;
+}
+function assertCanDeleteBus(doc, busId) {
+  if (doc.buses.length <= 1) {
+    throw new RoutingError("empty-bus", "\u4E0D\u80FD\u5220\u9664\u6700\u540E\u4E00\u4E2A\u6709\u6548\u603B\u7EBF");
+  }
+  if (doc.tracks.some((t) => t.busId === busId)) {
+    throw new RoutingError("nonempty-bus", "\u8BE5\u603B\u7EBF\u4ECD\u6709\u58F0\u8F68\u6210\u5458\uFF0C\u8BF7\u5148\u8FC1\u79FB\u540E\u518D\u5220\u9664");
+  }
+  if (doc.buses.some((b) => b.parentId === busId)) {
+    throw new RoutingError("nonempty-bus", "\u8BE5\u603B\u7EBF\u4ECD\u6709\u5B50\u603B\u7EBF\uFF0C\u8BF7\u5148\u6539\u63A5\u5B50\u603B\u7EBF\u540E\u518D\u5220\u9664");
+  }
+}
+function ancestorBusIds(buses2, busId) {
+  const byId = new Map(buses2.map((b) => [b.id, b]));
+  const out = /* @__PURE__ */ new Set();
+  let cur = busId;
+  while (cur && !out.has(cur)) {
+    out.add(cur);
+    cur = byId.get(cur)?.parentId ?? null;
+  }
+  return out;
+}
+function descendantBusIds(buses2, busId) {
+  const out = /* @__PURE__ */ new Set();
+  const walk = (id) => {
+    for (const b of buses2) {
+      if (b.parentId === id && !out.has(b.id)) {
+        out.add(b.id);
+        walk(b.id);
+      }
+    }
+  };
+  walk(busId);
+  return out;
+}
+function routeSnapshot(buses2, tracks) {
+  const soloBuses = buses2.filter((b) => b.solo).map((b) => b.id);
+  const soloAncestors = /* @__PURE__ */ new Set();
+  soloBuses.forEach((id) => ancestorBusIds(buses2, id).forEach((x) => soloAncestors.add(x)));
+  const anyBusSolo = soloBuses.length > 0;
+  const anyTrackSolo = tracks.some((t) => t.solo);
+  return {
+    anyBusSolo,
+    anyTrackSolo,
+    busActive: new Map(
+      buses2.map((b) => [b.id, !b.muted && (!anyBusSolo || soloAncestors.has(b.id))])
+    )
+  };
+}
+function isTrackAudibleInDoc(track, doc) {
+  if (track.muted || doc.masterMuted) return false;
+  const { anyTrackSolo, busActive } = routeSnapshot(doc.buses, doc.tracks);
+  if (!busActive.get(track.busId)) return false;
+  if (anyTrackSolo && !track.solo) return false;
+  return true;
+}
+var DEFAULT_BUS_IDS, BUS_COLORS, RoutingError;
+var init_routing = __esm({
+  "src/lib/routing.ts"() {
+    "use strict";
+    init_types();
+    DEFAULT_BUS_IDS = ["bus-a", "bus-b"];
+    BUS_COLORS = ["#4ecdc4", "#a78bfa", "#f472b6", "#34d399", "#60a5fa", "#ffe066"];
+    RoutingError = class extends Error {
+      code;
+      constructor(code, message) {
+        super(message);
+        this.name = "RoutingError";
+        this.code = code;
+      }
+    };
+  }
+});
+
 // src/lib/spatial.ts
 function forwardVector(yaw, pitch = 0) {
   return {
@@ -120,6 +301,9 @@ __export(audioEngine_exports, {
   AudioEngine: () => AudioEngine,
   DecodeError: () => DecodeError
 });
+function emptyLevels() {
+  return { l: 0, r: 0, clipL: false, clipR: false };
+}
 function localUp(yaw, pitch) {
   const cp = Math.cos(pitch);
   const sp = Math.sin(pitch);
@@ -133,6 +317,8 @@ var DecodeError, AudioEngine;
 var init_audioEngine = __esm({
   "src/lib/audioEngine.ts"() {
     "use strict";
+    init_types();
+    init_routing();
     init_spatial();
     init_samples();
     DecodeError = class extends Error {
@@ -146,26 +332,33 @@ var init_audioEngine = __esm({
     AudioEngine = class {
       ctx = null;
       unlock = "locked";
-      busGain = null;
       masterGain = null;
-      soloBus = null;
-      muteBus = null;
-      analyser = null;
+      masterAnalyser = null;
+      masterWorklet = null;
       timeDomainBuf = new Float32Array(new ArrayBuffer(8192));
-      peakWorklet = null;
+      peakWorkletReady = false;
       workletFailed = false;
+      workletGeneration = 0;
+      insertingWorklets = null;
+      disposed = false;
+      busNodes = /* @__PURE__ */ new Map();
       voices = /* @__PURE__ */ new Map();
       buffers = /* @__PURE__ */ new Map();
       pendingFiles = /* @__PURE__ */ new Map();
       spatial = null;
-      anySolo = false;
+      routing = {
+        buses: createDefaultBuses(),
+        tracks: [],
+        masterGain: 0.9,
+        masterMuted: false
+      };
+      meterLevels = { [MASTER_METER_ID]: emptyLevels() };
+      /** 由 UI 注入的最新已校验文档读取器，保证解锁后立即 ensureTrack 时也能拿到刚提交的总线。 */
+      getLatestRouting = null;
       unlockListeners = /* @__PURE__ */ new Set();
       levelListeners = /* @__PURE__ */ new Set();
       endedListeners = /* @__PURE__ */ new Set();
       rafHandle = 0;
-      clipLatchL = false;
-      clipLatchR = false;
-      lastPeak = { l: 0, r: 0, clipL: false, clipR: false };
       onUnlock(fn) {
         this.unlockListeners.add(fn);
         fn(this.unlock);
@@ -196,81 +389,152 @@ var init_audioEngine = __esm({
         }
         this.unlock = "unlocking";
         this.emitUnlock();
+        const previousCtx = this.ctx;
+        this.ctx = null;
         try {
           const Ctor = window.AudioContext ?? window.webkitAudioContext;
           if (!Ctor) throw new Error("\u5F53\u524D\u6D4F\u89C8\u5668\u4E0D\u652F\u6301 Web Audio API");
           const ctx = new Ctor();
           this.ctx = ctx;
+          const latest = this.getLatestRouting?.();
+          if (latest) this.routing = latest;
+          this.disposed = false;
+          this.workletFailed = false;
           this.buildGraph(ctx);
           if (ctx.state === "suspended") await ctx.resume();
           if (ctx.state !== "running") {
             throw new Error("AudioContext \u88AB\u6D4F\u89C8\u5668\u7B56\u7565\u963B\u6B62\uFF0C\u672A\u80FD\u8FDB\u5165 running \u72B6\u6001");
           }
+          if (previousCtx) void previousCtx.close();
           this.unlock = "unlocked";
           this.emitUnlock();
           this.startMeterLoop();
-          void this.ensurePeakWorklet(ctx);
+          void this.ensurePeakWorklets(ctx);
         } catch (err) {
+          if (this.ctx) void this.ctx.close();
+          else if (previousCtx) void previousCtx.close();
+          this.ctx = null;
           this.unlock = "failed";
           this.emitUnlock();
           throw err;
         }
       }
       buildGraph(ctx) {
-        this.soloBus = ctx.createGain();
-        this.muteBus = ctx.createGain();
-        this.muteBus.gain.value = 0;
-        this.busGain = ctx.createGain();
         this.masterGain = ctx.createGain();
-        this.analyser = ctx.createAnalyser();
-        this.analyser.fftSize = 2048;
-        this.timeDomainBuf = new Float32Array(new ArrayBuffer(this.analyser.fftSize * 4));
-        this.soloBus.connect(this.busGain);
-        this.muteBus.connect(this.busGain);
-        this.busGain.connect(this.masterGain);
-        this.masterGain.connect(this.analyser);
-        this.analyser.connect(ctx.destination);
+        this.masterAnalyser = ctx.createAnalyser();
+        this.masterAnalyser.fftSize = 2048;
+        this.timeDomainBuf = new Float32Array(new ArrayBuffer(this.masterAnalyser.fftSize * 4));
+        this.masterWorklet = null;
+        this.peakWorkletReady = false;
+        this.workletGeneration += 1;
+        this.insertingWorklets = null;
+        this.busNodes.clear();
+        this.voices.clear();
+        this.buffers.clear();
+        this.pendingFiles.clear();
+        this.meterLevels = { [MASTER_METER_ID]: emptyLevels() };
+        for (const bus of this.routing.buses) this.createBusNode(ctx, bus);
+        this.reconnectBuses();
+        this.applyMasterGain();
+        this.masterGain.connect(this.masterAnalyser);
+        this.masterAnalyser.connect(ctx.destination);
+      }
+      createBusNode(ctx, bus) {
+        const gain = ctx.createGain();
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        const nodes = { spec: { ...bus }, gain, analyser, worklet: null };
+        this.busNodes.set(bus.id, nodes);
+        this.meterLevels[bus.id] = emptyLevels();
+        gain.connect(analyser);
+        return nodes;
+      }
+      reconnectBuses() {
+        if (!this.ctx) return;
+        for (const nodes of this.busNodes.values()) {
+          nodes.analyser.disconnect();
+          const parentId = nodes.spec.parentId;
+          const parent = parentId ? this.busNodes.get(parentId) : null;
+          if (parentId && !parent) continue;
+          nodes.analyser.connect(parent ? parent.gain : this.masterGain);
+        }
+      }
+      reconcileBuses(ctx, buses2) {
+        const previousParents = new Map([...this.busNodes].map(([id, nodes]) => [id, nodes.spec.parentId]));
+        const next = /* @__PURE__ */ new Map();
+        for (const bus of buses2) next.set(bus.id, bus);
+        for (const id of [...this.busNodes.keys()]) {
+          if (!next.has(id)) {
+            const old = this.busNodes.get(id);
+            this.disconnectBusNode(old);
+            this.busNodes.delete(id);
+            delete this.meterLevels[id];
+          }
+        }
+        let parentsChanged = false;
+        for (const bus of buses2) {
+          let nodes = this.busNodes.get(bus.id);
+          if (!nodes) {
+            nodes = this.createBusNode(ctx, bus);
+            parentsChanged = true;
+          }
+          if (previousParents.get(bus.id) !== bus.parentId) parentsChanged = true;
+          nodes.spec = { ...bus };
+          nodes.gain.gain.setTargetAtTime(bus.muted ? 0 : bus.gain, ctx.currentTime, 0.01);
+        }
+        if (parentsChanged || this.busNodes.size !== buses2.length) this.reconnectBuses();
+        if (this.peakWorkletReady) void this.insertAvailableWorklets(ctx);
+      }
+      disconnectBusNode(nodes) {
+        try {
+          nodes.gain.disconnect();
+          nodes.analyser.disconnect();
+          nodes.worklet?.disconnect();
+        } catch {
+        }
       }
       /**
-       * 峰值/削波检测器串联在 masterGain 之后、destination 之前的真实输出链上，
-       * 逐采样扫描。Worklet 源码以 Blob 注入，无需额外网络资源。
+       * 逐采样峰值/削波检测器串联在每个 bus/master GainNode 之后。
+       * Worklet 源码以 Blob 注入，无需额外网络资源。
        */
-      async ensurePeakWorklet(ctx) {
-        if (this.peakWorklet || this.workletFailed) return !!this.peakWorklet;
+      async ensurePeakWorklets(ctx) {
+        if (this.peakWorkletReady || this.workletFailed) return this.peakWorkletReady;
+        const generation = this.workletGeneration;
         try {
           const workletSource = `
-class PeakMeterProcessor extends AudioWorkletProcessor {
+class MeterProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() { return []; }
   process(inputs, outputs) {
-    const in0 = inputs[0];
-    const out0 = outputs[0];
-    if (!in0 || in0.length === 0) {
-      // \u4E0A\u6E38\u9759\u9ED8\u4F18\u5316\u65F6\u8F93\u51FA\u4FDD\u6301\u96F6\u586B\u5145\u5373\u53EF
-      return true;
-    }
-    let peakL = 0, peakR = 0, clipL = false, clipR = false;
+    const in0 = inputs[0] || [];
+    const out0 = outputs[0] || [];
     const l = in0[0];
     const r = in0[1] || in0[0];
     const ol = out0[0];
     const or = out0[1] || out0[0];
-    for (let i = 0; i < l.length; i++) {
-      const vl = l[i];
-      const al = Math.abs(vl);
-      if (al > peakL) peakL = al;
-      if (al >= 1.0) clipL = true;
-      if (ol) ol[i] = vl; // \u5FC5\u987B\u663E\u5F0F\u900F\u4F20\uFF0C\u5426\u5219\u8F93\u51FA\u9759\u97F3
+    let peakL = 0, peakR = 0, clipL = false, clipR = false;
+    if (l && ol) {
+      for (let i = 0; i < l.length; i++) {
+        const vl = l[i];
+        const al = Math.abs(vl);
+        if (al > peakL) peakL = al;
+        if (al >= 1.0) clipL = true;
+        ol[i] = vl;
+      }
     }
-    if (r && or) for (let i = 0; i < r.length; i++) {
-      const vr = r[i];
-      const ar = Math.abs(vr);
-      if (ar > peakR) peakR = ar;
-      if (ar >= 1.0) clipR = true;
-      if (out0[1]) or[i] = vr;
+    if (r && or) {
+      for (let i = 0; i < r.length; i++) {
+        const vr = r[i];
+        const ar = Math.abs(vr);
+        if (ar > peakR) peakR = ar;
+        if (ar >= 1.0) clipR = true;
+        or[i] = vr;
+      }
     }
     this.port.postMessage({ l: peakL, r: peakR, clipL, clipR });
     return true;
   }
 }
-registerProcessor('peak-meter', PeakMeterProcessor);
+registerProcessor('routing-meter', MeterProcessor);
 `;
           const blob = new Blob([workletSource], { type: "application/javascript" });
           const url = URL.createObjectURL(blob);
@@ -279,63 +543,109 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           } finally {
             URL.revokeObjectURL(url);
           }
-          const node = new AudioWorkletNode(ctx, "peak-meter", {
-            // 节点串在真实输出链上：必须保持立体声直通，避免被下混成单声道
+          if (this.disposed || this.ctx !== ctx || generation !== this.workletGeneration) return false;
+          this.peakWorkletReady = true;
+          await this.insertAvailableWorklets(ctx, generation);
+          return true;
+        } catch {
+          if (generation === this.workletGeneration) this.workletFailed = true;
+          return false;
+        }
+      }
+      insertAvailableWorklets(ctx, generation = this.workletGeneration) {
+        if (!this.peakWorkletReady || this.ctx !== ctx || generation !== this.workletGeneration || this.insertingWorklets) {
+          return this.insertingWorklets ?? Promise.resolve();
+        }
+        const job = this.insertWorkletNodes(ctx, generation);
+        this.insertingWorklets = job;
+        void job.finally(() => {
+          if (this.insertingWorklets === job) this.insertingWorklets = null;
+        });
+        return job;
+      }
+      async insertWorkletNodes(ctx, generation) {
+        const insert = async (id, source, analyser, existing) => {
+          if (existing || !this.peakWorkletReady || this.ctx !== ctx || generation !== this.workletGeneration) {
+            return existing;
+          }
+          const node = new AudioWorkletNode(ctx, "routing-meter", {
             numberOfInputs: 1,
             numberOfOutputs: 1,
             outputChannelCount: [2]
           });
           node.channelCount = 2;
           node.channelInterpretation = "speakers";
-          this.masterGain.disconnect();
-          this.masterGain.connect(node);
-          this.analyser.disconnect();
-          node.connect(this.analyser);
-          this.analyser.connect(ctx.destination);
+          source.disconnect();
+          source.connect(node);
+          node.connect(analyser);
           node.port.onmessage = (e) => {
-            const d = e.data;
-            if (d.clipL) this.clipLatchL = true;
-            if (d.clipR) this.clipLatchR = true;
-            this.lastPeak = { l: d.l, r: d.r, clipL: this.clipLatchL, clipR: this.clipLatchR };
+            this.recordWorkletLevel(id, e.data);
           };
-          this.peakWorklet = node;
-          return true;
-        } catch {
-          this.workletFailed = true;
-          return false;
+          return node;
+        };
+        if (this.masterGain && this.masterAnalyser) {
+          this.masterWorklet = await insert(
+            MASTER_METER_ID,
+            this.masterGain,
+            this.masterAnalyser,
+            this.masterWorklet
+          );
+        }
+        for (const nodes of this.busNodes.values()) {
+          nodes.worklet = await insert(nodes.spec.id, nodes.gain, nodes.analyser, nodes.worklet);
         }
       }
-      clearClipLatch() {
-        this.clipLatchL = false;
-        this.clipLatchR = false;
+      recordWorkletLevel(id, d) {
+        const prev = this.meterLevels[id] ?? emptyLevels();
+        this.meterLevels[id] = {
+          l: d.l,
+          r: d.r,
+          clipL: prev.clipL || d.clipL,
+          clipR: prev.clipR || d.clipR
+        };
+      }
+      clearClipLatch(id) {
+        if (id) {
+          const level = this.meterLevels[id];
+          if (level) this.meterLevels[id] = { ...level, clipL: false, clipR: false };
+          return;
+        }
+        for (const key of Object.keys(this.meterLevels)) {
+          this.meterLevels[key] = { ...this.meterLevels[key], clipL: false, clipR: false };
+        }
       }
       startMeterLoop() {
         const tick = () => {
-          if (!this.peakWorklet && this.analyser) {
-            this.analyser.getFloatTimeDomainData(this.timeDomainBuf);
-            let peak = 0;
-            for (let i = 0; i < this.timeDomainBuf.length; i++) {
-              const a = Math.abs(this.timeDomainBuf[i]);
-              if (a > peak) peak = a;
-            }
-            if (peak >= 1) {
-              this.clipLatchL = true;
-              this.clipLatchR = true;
-            }
-            this.lastPeak = {
-              l: peak,
-              r: peak,
-              clipL: this.clipLatchL,
-              clipR: this.clipLatchR
-            };
+          if (!this.peakWorkletReady) {
+            this.pollAnalyser(MASTER_METER_ID, this.masterAnalyser ?? null);
+            for (const [id, nodes] of this.busNodes) this.pollAnalyser(id, nodes.analyser);
           }
-          const p = this.lastPeak;
-          this.levelListeners.forEach((fn) => fn({ ...p }));
+          const snapshot = Object.fromEntries(
+            Object.entries(this.meterLevels).map(([id, v]) => [id, { ...v }])
+          );
+          this.levelListeners.forEach((fn) => fn(snapshot));
           this.rafHandle = requestAnimationFrame(tick);
         };
         this.rafHandle = requestAnimationFrame(tick);
       }
-      // ---------- 全局参数 ----------
+      pollAnalyser(id, analyser) {
+        if (!analyser) return;
+        analyser.getFloatTimeDomainData(this.timeDomainBuf);
+        let peak = 0;
+        for (let i = 0; i < this.timeDomainBuf.length; i++) {
+          const a = Math.abs(this.timeDomainBuf[i]);
+          if (a > peak) peak = a;
+        }
+        const prev = this.meterLevels[id] ?? emptyLevels();
+        const clip = peak >= 1;
+        this.meterLevels[id] = {
+          l: peak,
+          r: peak,
+          clipL: prev.clipL || clip,
+          clipR: prev.clipR || clip
+        };
+      }
+      // ---------- 全局参数与路由 ----------
       setSpatialSettings(s) {
         this.spatial = s;
         if (!this.ctx) return;
@@ -346,15 +656,29 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           v.panner.maxDistance = s.maxDistance;
         }
       }
-      setBusGain(g2) {
-        if (this.busGain && this.ctx) {
-          this.busGain.gain.setTargetAtTime(g2, this.ctx.currentTime, 0.01);
+      setRoutingProvider(fn) {
+        this.getLatestRouting = fn;
+      }
+      /** 完整替换路由/成员/总线状态。调用方必须已经通过 routing 校验。 */
+      syncRouting(state) {
+        this.routing = {
+          buses: state.buses.map((b) => ({ ...b })),
+          tracks: state.tracks.map((t) => ({ ...t })),
+          masterGain: state.masterGain,
+          masterMuted: state.masterMuted
+        };
+        if (!this.ctx) return;
+        this.reconcileBuses(this.ctx, state.buses);
+        this.applyMasterGain();
+        for (const track of state.tracks) {
+          const voice = this.voices.get(track.id);
+          if (voice) this.updateVoiceLive(voice, track, state.buses, state.tracks);
         }
       }
-      setMasterGain(g2) {
-        if (this.masterGain && this.ctx) {
-          this.masterGain.gain.setTargetAtTime(g2, this.ctx.currentTime, 0.01);
-        }
+      applyMasterGain() {
+        if (!this.ctx || !this.masterGain) return;
+        const value = this.routing.masterMuted ? 0 : this.routing.masterGain;
+        this.masterGain.gain.setTargetAtTime(value, this.ctx.currentTime, 0.01);
       }
       /** 听者位置/朝向；朝向定义与 spatial.ts、Three.js 相机严格一致 */
       setListener(l) {
@@ -376,10 +700,43 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         set(li.upY, u.y);
         set(li.upZ, u.z);
       }
+      effectiveTrackGain(track, buses2, allTracks) {
+        if (track.muted || this.routing.masterMuted) return 0;
+        const byId = new Map(buses2.map((b) => [b.id, b]));
+        let cur = track.busId;
+        const chain = [];
+        const guard = /* @__PURE__ */ new Set();
+        while (cur) {
+          if (guard.has(cur)) return 0;
+          guard.add(cur);
+          const bus = byId.get(cur);
+          if (!bus) return 0;
+          chain.push(bus);
+          cur = bus.parentId;
+        }
+        const soloBusIds = buses2.filter((b) => b.solo).map((b) => b.id);
+        if (soloBusIds.length > 0) {
+          const active = /* @__PURE__ */ new Set();
+          for (const soloId of soloBusIds) {
+            let id = soloId;
+            const seen = /* @__PURE__ */ new Set();
+            while (id && !seen.has(id)) {
+              seen.add(id);
+              active.add(id);
+              id = byId.get(id)?.parentId ?? null;
+            }
+          }
+          if (!chain.some((b) => active.has(b.id))) return 0;
+        } else if (allTracks.some((t) => t.solo) && !track.solo) {
+          return 0;
+        }
+        if (chain.some((b) => b.muted)) return 0;
+        return track.gain;
+      }
       // ---------- 声轨缓冲与节点 ----------
       /**
        * 确保声轨缓冲与节点就绪。
-       * 已存在的 voice 只做实时参数更新（位置/增益/路由/loop），绝不重启源。
+       * 已存在的 voice 只做实时参数更新（位置/增益/总线/loop），绝不重启源。
        */
       async ensureTrack(track) {
         if (!this.ctx || this.unlock !== "unlocked") return;
@@ -406,7 +763,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         if (!existing) {
           this.voices.set(track.id, this.createVoice(track, buffer));
         } else {
-          this.updateVoiceLive(existing, track);
+          this.updateVoiceLive(existing, track, this.routing.buses, this.routing.tracks);
         }
       }
       /** 文件 Blob 在解锁后由 UI 层提供（来自 IndexedDB，全程本地） */
@@ -422,7 +779,11 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         source.buffer = buffer;
         source.loop = track.loop;
         const trackGain = ctx.createGain();
-        trackGain.gain.value = track.muted ? 0 : track.gain;
+        trackGain.gain.value = this.effectiveTrackGain(
+          track,
+          this.routing.buses,
+          this.routing.tracks.some((t) => t.id === track.id) ? this.routing.tracks : [...this.routing.tracks, track]
+        );
         const panner = new PannerNode(ctx, {
           panningModel: "HRTF",
           distanceModel: this.spatial?.distanceModel ?? "inverse",
@@ -442,15 +803,16 @@ registerProcessor('peak-meter', PeakMeterProcessor);
           splitter.connect(trackGain, ch);
         }
         trackGain.connect(panner);
-        const audible = this.shouldBeAudible(track);
-        panner.connect(audible ? this.soloBus : this.muteBus);
+        const bus = this.busNodes.get(track.busId);
+        if (!bus) throw new Error(`\u58F0\u8F68\u300C${track.name}\u300D\u6307\u5411\u65E0\u6548\u603B\u7EBF\uFF0C\u65E0\u6CD5\u5EFA\u7ACB\u97F3\u9891\u8282\u70B9`);
+        panner.connect(bus.gain);
         const voice = {
           trackId: track.id,
           spec: track,
           source,
           trackGain,
           panner,
-          audiblyRouted: audible,
+          busId: track.busId,
           playing: false,
           consumed: false,
           startedAt: 0,
@@ -470,58 +832,36 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         };
         return voice;
       }
-      shouldBeAudible(track) {
-        if (track.muted) return false;
-        if (this.anySolo) return track.solo;
-        return true;
-      }
-      /** 实时参数更新：不触碰 source 节点 —— 移动声源不会重启音轨 */
-      updateVoiceLive(voice, track) {
+      /** 实时参数更新：不触碰 source —— 换总线/移动声源都不会重启音轨 */
+      updateVoiceLive(voice, track, buses2, allTracks) {
         const ctx = this.ctx;
         const t = ctx.currentTime;
         const tau = Math.max(5e-3, this.spatial?.positionTimeConstant ?? 0.05);
+        if (voice.busId !== track.busId) {
+          const target = this.busNodes.get(track.busId);
+          if (!target) throw new Error(`\u76EE\u6807\u603B\u7EBF\u4E0D\u5B58\u5728\uFF1A${track.busId}`);
+          voice.panner.disconnect();
+          voice.panner.connect(target.gain);
+          voice.busId = track.busId;
+        }
         voice.panner.positionX.setTargetAtTime(track.position.x, t, tau);
         voice.panner.positionY.setTargetAtTime(track.position.y, t, tau);
         voice.panner.positionZ.setTargetAtTime(track.position.z, t, tau);
         voice.panner.distanceModel = this.spatial?.distanceModel ?? voice.panner.distanceModel;
-        voice.trackGain.gain.setTargetAtTime(track.muted ? 0 : track.gain, t, 0.01);
+        voice.trackGain.gain.setTargetAtTime(this.effectiveTrackGain(track, buses2, allTracks), t, 0.01);
         if (voice.source.loop !== track.loop) voice.source.loop = track.loop;
-        const audible = this.shouldBeAudible(track);
-        if (audible !== voice.audiblyRouted) {
-          voice.panner.disconnect();
-          voice.panner.connect(audible ? this.soloBus : this.muteBus);
-          voice.audiblyRouted = audible;
-        }
         voice.spec = track;
       }
-      /** 静音/独奏变化：重新评估全部路由（增益本身在 updateVoiceLive 中已设置） */
-      reevaluateRouting(tracks) {
-        this.anySolo = tracks.some((t) => t.solo);
-        if (!this.ctx) return;
-        for (const tr of tracks) {
-          const v = this.voices.get(tr.id);
-          if (!v) continue;
-          const audible = this.shouldBeAudible(tr);
-          if (audible !== v.audiblyRouted) {
-            v.panner.disconnect();
-            v.panner.connect(audible ? this.soloBus : this.muteBus);
-            v.audiblyRouted = audible;
-          }
-          v.trackGain.gain.setTargetAtTime(tr.muted ? 0 : tr.gain, this.ctx.currentTime, 0.01);
-          v.spec = tr;
-        }
-      }
       /**
-       * 高频实时同步：对已存在的 voice 更新位置/增益/loop/独奏路由。
-       * 不创建节点、不触碰 source，移动声源不会重启音轨。
-       * 尚未创建 voice 的声轨（未解锁/未解码）跳过，由 ensureTrack 负责。
+       * 高频实时同步：只更新 AudioParam 与 panner 的一条输出连接。
+       * 不创建 BufferSource、不 stop/start，移动或换总线均不重启。
        */
       syncTracks(tracks) {
         if (!this.ctx) return;
-        this.anySolo = tracks.some((t) => t.solo);
+        this.routing.tracks = tracks.map((t) => ({ ...t }));
         for (const tr of tracks) {
           const v = this.voices.get(tr.id);
-          if (v) this.updateVoiceLive(v, tr);
+          if (v) this.updateVoiceLive(v, tr, this.routing.buses, tracks);
         }
       }
       getChannelCount(trackId) {
@@ -529,7 +869,7 @@ registerProcessor('peak-meter', PeakMeterProcessor);
       }
       /**
        * 重建声轨输入图（切换立体声文件的 L/R 声道时使用）。
-       * 保持播放偏移；若原本在播放，从同一位置继续（声道选择本身不属于“移动”）。
+       * 保持播放偏移；若原本在播放，从同一位置继续。总线迁移严禁走此路径。
        */
       async rebuildVoiceGraph(track) {
         await this.ensureTrack(track);
@@ -593,8 +933,8 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         }
       }
       /**
-       * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转）。
-       * 位置移动严禁走此路径。
+       * 停止旧节点并按最新参数重建（仅用于暂停/停止/跳转/L-R 输入选择）。
+       * 位置移动和总线迁移严禁走此路径。
        */
       replaceVoice(old, track, buffer, offset) {
         try {
@@ -643,10 +983,19 @@ registerProcessor('peak-meter', PeakMeterProcessor);
         return this.voices.get(trackId)?.playing ?? false;
       }
       dispose() {
+        this.disposed = true;
+        this.workletGeneration += 1;
         cancelAnimationFrame(this.rafHandle);
         for (const id of [...this.voices.keys()]) this.removeTrack(id);
+        for (const nodes of this.busNodes.values()) this.disconnectBusNode(nodes);
+        this.busNodes.clear();
         void this.ctx?.close();
         this.ctx = null;
+        this.masterGain = null;
+        this.masterAnalyser = null;
+        this.masterWorklet = null;
+        this.peakWorkletReady = false;
+        this.workletFailed = false;
         this.unlock = "locked";
       }
     };
@@ -688,8 +1037,6 @@ var FakeNode = class {
 var FakeGain = class extends FakeNode {
   gain = new FakeAudioParam(1);
 };
-var FakeStereoPanner = class extends FakeNode {
-};
 var FakeDestination = class extends FakeNode {
 };
 var FakePanner = class extends FakeNode {
@@ -701,8 +1048,6 @@ var FakePanner = class extends FakeNode {
   positionX = new FakeAudioParam(0);
   positionY = new FakeAudioParam(0);
   positionZ = new FakeAudioParam(0);
-  positionTimeConstant = 0;
-  orientationX = new FakeAudioParam(1);
   constructor(_ctx, opts = {}) {
     super();
     Object.assign(this, opts);
@@ -747,8 +1092,6 @@ var FakeSplitter = class extends FakeNode {
     this.channels = channels;
   }
 };
-var FakeMerger = class extends FakeNode {
-};
 var FakeListener = class {
   positionX = new FakeAudioParam(0);
   positionY = new FakeAudioParam(0);
@@ -769,7 +1112,6 @@ var FakeAnalyser = class extends FakeNode {
 var FakeAudioContext = class {
   state = "running";
   currentTime = 0;
-  playbackRate = { value: 1 };
   destination = new FakeDestination();
   listener = new FakeListener();
   sampleRate = 48e3;
@@ -790,14 +1132,8 @@ var FakeAudioContext = class {
   createChannelSplitter(ch) {
     return new FakeSplitter(ch);
   }
-  createChannelMerger(ch) {
-    return new FakeMerger();
-  }
   createAnalyser() {
     return new FakeAnalyser();
-  }
-  createStereoPanner() {
-    return new FakeStereoPanner();
   }
   async resume() {
     this.state = "running";
@@ -812,19 +1148,19 @@ var FakeAudioContext = class {
 };
 var g = globalThis;
 g.AudioContext = FakeAudioContext;
-g.requestAnimationFrame = (fn) => {
-  return setTimeout(() => fn(0), 16);
-};
+g.requestAnimationFrame = (fn) => setTimeout(() => fn(0), 16);
 g.cancelAnimationFrame = (id) => clearTimeout(id);
 g.window = globalThis;
 g.PannerNode = FakePanner;
 var { AudioEngine: AudioEngine2, DecodeError: DecodeError2 } = await Promise.resolve().then(() => (init_audioEngine(), audioEngine_exports));
 var { createSampleBuffer: createSampleBuffer2 } = await Promise.resolve().then(() => (init_samples(), samples_exports));
+var { createDefaultBuses: createDefaultBuses2 } = await Promise.resolve().then(() => (init_routing(), routing_exports));
 function baseTrack(over = {}) {
   return {
     id: "t1",
     name: "T",
     sourceType: "tone",
+    busId: "bus-a",
     loop: false,
     muted: false,
     solo: false,
@@ -835,6 +1171,20 @@ function baseTrack(over = {}) {
     status: "pending",
     ...over
   };
+}
+function buses() {
+  return createDefaultBuses2();
+}
+function routeState(tracks, overrides = {}) {
+  return {
+    buses: overrides.buses ?? buses(),
+    tracks,
+    masterGain: overrides.masterGain ?? 0.9,
+    masterMuted: overrides.masterMuted ?? false
+  };
+}
+function internals(engine) {
+  return engine;
 }
 describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", () => {
   let engine;
@@ -850,7 +1200,6 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     engine.setListener({
       position: { x: 0, y: 0, z: 3 },
       yaw: Math.PI / 2,
-      // 右转 → forward (+1,0,0)
       pitch: 0,
       earHeight: 0
     });
@@ -860,7 +1209,7 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     assert.ok(Math.abs(li.upY.value - 1) < 1e-6);
     assert.ok(Math.abs(li.positionZ.value - 3) < 1e-6);
   });
-  it("\u58F0\u8F68\u94FE\u8DEF\u4E3A source\u2192trackGain\u2192HRTF panner\u2192soloBus\u2192\u2026\u2192destination\uFF1B\u8DDD\u79BB\u6A21\u578B\u53C2\u6570\u4E0B\u53D1", async () => {
+  it("\u58F0\u8F68\u94FE\u8DEF\u4E3A source\u2192trackGain\u2192HRTF panner\u2192\u6240\u5C5E\u603B\u7EBF\u2192\u4E3B\u8F93\u51FA\uFF1B\u8DDD\u79BB\u6A21\u578B\u53C2\u6570\u4E0B\u53D1", async () => {
     await engine.resume();
     engine.setSpatialSettings({
       distanceModel: "exponential",
@@ -872,8 +1221,8 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     });
     const track = baseTrack();
     await engine.ensureTrack(track);
-    const voices = engine.voices;
-    const v = voices.get("t1");
+    const ie = internals(engine);
+    const v = ie.voices.get("t1");
     assert.equal(v.panner.panningModel, "HRTF");
     assert.equal(v.panner.distanceModel, "exponential");
     assert.equal(v.panner.refDistance, 2);
@@ -882,42 +1231,80 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     assert.ok(Math.abs(v.panner.positionX.value - 2) < 1e-9);
     assert.ok(v.source.connects.some((c) => c.node === v.trackGain));
     assert.ok(v.trackGain.connects.some((c) => c.node === v.panner));
-    const soloBus = engine.soloBus;
-    assert.ok(v.panner.connects.some((c) => c.node === soloBus));
+    const busA = ie.busNodes.get("bus-a");
+    assert.deepEqual(v.panner.connects.map((c) => c.node), [busA.gain]);
+    assert.ok(busA.gain.connects.some((c) => c.node === busA.analyser));
+    assert.ok(busA.analyser.connects.some((c) => c.node === ie.masterGain));
   });
-  it("\u9759\u97F3\u771F\u5B9E\u628A trackGain \u7F6E 0\uFF1B\u72EC\u594F\u628A\u975E\u72EC\u594F\u58F0\u8F68\u5207\u5230 muteBus", async () => {
+  it("\u8C03\u6574\u4E00\u4E2A\u603B\u7EBF\u589E\u76CA\u53EA\u5F71\u54CD\u8BE5\u603B\u7EBF GainNode\uFF0C\u53E6\u4E00\u603B\u7EBF\u548C\u4E3B\u8F93\u51FA\u4FDD\u6301\u4E0D\u53D8", async () => {
     await engine.resume();
-    const a = baseTrack({ id: "a" });
-    const b = baseTrack({ id: "b", position: { x: -2, y: 0, z: 0 } });
+    const a = baseTrack({ id: "a", busId: "bus-a" });
+    const b = baseTrack({ id: "b", busId: "bus-b", position: { x: -2, y: 0, z: 0 } });
+    engine.syncRouting(routeState([a, b]));
     await engine.ensureTrack(a);
     await engine.ensureTrack(b);
-    const voices = engine.voices;
-    const muteBus = engine.muteBus;
-    engine.syncTracks([{ ...a, muted: true }, b]);
-    assert.equal(voices.get("a").trackGain.gain.value, 0);
-    assert.equal(voices.get("b").trackGain.gain.value, 0.8);
-    engine.syncTracks([{ ...a, muted: true }, { ...b, solo: true }]);
-    assert.ok(voices.get("a").panner.connects.some((c) => c.node === muteBus));
-    assert.ok(
-      voices.get("b").panner.connects.every((c) => c.node !== muteBus)
-    );
-    engine.syncTracks([{ ...a, muted: true }, b]);
-    assert.ok(voices.get("a").panner.connects.some((c) => c.node === muteBus));
-    assert.ok(
-      voices.get("a").panner.connects.every((c) => c.node === muteBus)
-    );
+    const ie = internals(engine);
+    const nextBuses = buses();
+    nextBuses[0].gain = 0.25;
+    engine.syncRouting(routeState([a, b], { buses: nextBuses }));
+    assert.equal(ie.busNodes.get("bus-a").gain.gain.value, 0.25);
+    assert.equal(ie.busNodes.get("bus-b").gain.gain.value, 1);
+    assert.equal(ie.masterGain.gain.value, 0.9);
   });
-  it("\u79FB\u52A8\u58F0\u6E90\u53EA\u5199 AudioParam\uFF0C\u7EDD\u4E0D stop/start source\uFF08\u4E0D\u91CD\u542F\u97F3\u8F68\uFF09", async () => {
+  it("\u603B\u7EBF\u72EC\u594F\u53EA\u8BA9\u5176\u4ED6\u603B\u7EBF\u7269\u7406\u9759\u97F3\uFF1B\u72EC\u594F\u603B\u7EBF\u5185\u539F\u672C M \u7684\u8F68\u4ECD\u4E3A 0", async () => {
+    await engine.resume();
+    const aMuted = baseTrack({ id: "a", busId: "bus-a", muted: true });
+    const b = baseTrack({ id: "b", busId: "bus-b", position: { x: -2, y: 0, z: 0 } });
+    engine.syncRouting(routeState([aMuted, b]));
+    await engine.ensureTrack(aMuted);
+    await engine.ensureTrack(b);
+    const ie = internals(engine);
+    const soloBuses = buses();
+    soloBuses[0].solo = true;
+    engine.syncRouting(routeState([aMuted, b], { buses: soloBuses }));
+    assert.equal(ie.voices.get("a").trackGain.gain.value, 0);
+    assert.equal(ie.voices.get("b").trackGain.gain.value, 0);
+    const aAudible = { ...aMuted, muted: false };
+    engine.syncRouting(routeState([aAudible, b], { buses: soloBuses }));
+    assert.equal(ie.voices.get("a").trackGain.gain.value, 0.8);
+    assert.equal(ie.voices.get("b").trackGain.gain.value, 0);
+  });
+  it("\u64AD\u653E\u4E2D\u8FC1\u79FB\u603B\u7EBF\u53EA\u91CD\u63A5\u4E00\u6B21 panner\uFF0C\u4E0D stop/start source\uFF0C\u65B9\u4F4D\u548C\u8282\u70B9\u8EAB\u4EFD\u4E0D\u53D8", async () => {
+    await engine.resume();
+    const t = baseTrack();
+    engine.syncRouting(routeState([t]));
+    await engine.playTrack(t);
+    const ie = internals(engine);
+    const before = ie.voices.get("t1");
+    const sourceBefore = before.source;
+    const pannerBefore = before.panner;
+    const startsBefore = sourceBefore.started.length;
+    const stopsBefore = sourceBefore.stopped;
+    const moved = { ...t, busId: "bus-b" };
+    engine.syncRouting(routeState([moved]));
+    const after = ie.voices.get("t1");
+    const busB = ie.busNodes.get("bus-b");
+    const busA = ie.busNodes.get("bus-a");
+    assert.equal(after.source, sourceBefore);
+    assert.equal(after.panner, pannerBefore);
+    assert.equal(after.busId, "bus-b");
+    assert.equal(after.panner.connects.length, 1);
+    assert.ok(!after.panner.connects.some((c) => c.node === busA.gain));
+    assert.deepEqual(after.panner.connects.map((c) => c.node), [busB.gain]);
+    assert.equal(sourceBefore.started.length, startsBefore);
+    assert.equal(sourceBefore.stopped, stopsBefore);
+    assert.equal(after.panner.positionX.value, 2);
+  });
+  it("\u79FB\u52A8\u58F0\u6E90\u53EA\u5199 AudioParam\uFF0C\u7EDD\u4E0D stop/start source", async () => {
     await engine.resume();
     const t = baseTrack();
     await engine.playTrack(t);
-    const v = engine.voices.get("t1");
+    const ie = internals(engine);
+    const v = ie.voices.get("t1");
     const startsBefore = v.source.started.length;
     const stopsBefore = v.source.stopped;
     for (let i = 0; i < 10; i++) {
-      engine.syncTracks([
-        { ...t, position: { x: 2 + i * 0.1, y: 0.5, z: -i * 0.2 } }
-      ]);
+      engine.syncTracks([{ ...t, position: { x: 2 + i * 0.1, y: 0.5, z: -i * 0.2 } }]);
     }
     assert.ok(Math.abs(v.panner.positionX.value - 2.9) < 1e-9);
     assert.ok(Math.abs(v.panner.positionY.value - 0.5) < 1e-9);
@@ -929,25 +1316,24 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     await engine.resume();
     const ctx = engine.ctx;
     const t = { ...baseTrack(), loop: false };
+    engine.syncRouting(routeState([t]));
     await engine.playTrack(t);
     ctx.currentTime = 0.3;
     engine.pauseTrack(t);
     await engine.playTrack({ ...t });
-    const v = engine.voices.get("t1");
+    const v = internals(engine).voices.get("t1");
     const last = v.source.started[v.source.started.length - 1];
     assert.ok(Math.abs(last.offset - 0.3) < 1e-6);
   });
-  it("\u603B\u7EBF\u4E0E\u4E3B\u589E\u76CA\u771F\u5B9E\u5199\u5165\u5BF9\u5E94 GainNode", async () => {
+  it("\u4E3B\u589E\u76CA\u548C\u4E3B\u9759\u97F3\u771F\u5B9E\u5199\u5165 masterGain\uFF1B\u4E3B\u8868\u4E32\u8054\u5728 destination \u524D", async () => {
     await engine.resume();
-    engine.setBusGain(0.42);
-    engine.setMasterGain(0.71);
-    const bus = engine.busGain;
-    const master = engine.masterGain;
-    assert.ok(Math.abs(bus.gain.value - 0.42) < 1e-9);
-    assert.ok(Math.abs(master.gain.value - 0.71) < 1e-9);
-    const analyser = engine.analyser;
+    const ie = internals(engine);
+    engine.syncRouting(routeState([], { masterGain: 0.71 }));
+    assert.equal(ie.masterGain.gain.value, 0.71);
+    engine.syncRouting(routeState([], { masterGain: 0.71, masterMuted: true }));
+    assert.equal(ie.masterGain.gain.value, 0);
     const destination = engine.ctx.destination;
-    assert.ok(analyser.connects.some((c) => c.node === destination));
+    assert.ok(ie.masterAnalyser.connects.some((c) => c.node === destination));
   });
   it("\u574F\u6587\u4EF6\u89E3\u7801\u5931\u8D25\u629B\u51FA DecodeError\uFF0C\u4E14\u4E0D\u5F71\u54CD\u5176\u4ED6\u58F0\u8F68", async () => {
     await engine.resume();
@@ -956,8 +1342,7 @@ describe("AudioEngine \u56FE\u884C\u4E3A\uFF08\u6A21\u62DF\u73AF\u5883\uFF09", (
     await assert.rejects(engine.ensureTrack(bad), (err) => err instanceof DecodeError2);
     const good = baseTrack({ id: "good" });
     await engine.ensureTrack(good);
-    const voices = engine.voices;
-    assert.ok(voices.has("good"));
+    assert.ok(internals(engine).voices.has("good"));
   });
   it("\u5185\u7F6E\u6837\u4F8B\u7F13\u51B2\u53EF\u7ECF\u5F15\u64CE\u5408\u6210\uFF0C\u65F6\u957F\u4E0E\u58F0\u9053\u7B26\u5408\u9884\u671F", async () => {
     await engine.resume();
